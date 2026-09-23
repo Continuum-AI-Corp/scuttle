@@ -51,8 +51,8 @@ func ParsePublicKey(s string) (PublicKeyBytes, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: capture public key is not hex: %v", ErrInvalidConfig, err)
 	}
-	if _, err := captureKEM().NewPublicKey(b); err != nil {
-		return nil, fmt.Errorf("%w: capture public key: %v", ErrInvalidConfig, err)
+	if _, err := loadPublicKey(b); err != nil {
+		return nil, err
 	}
 	return PublicKeyBytes(b), nil
 }

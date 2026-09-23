@@ -47,6 +47,10 @@ type vectorCase struct {
 	FieldKey   string        `json:"field_key"`
 	Ciphertext string        `json:"ciphertext"`
 	Plaintext  string        `json:"plaintext"`
+	// Unstamped rows are opened with an empty KemKeyID (the fallback path).
+	Unstamped bool `json:"unstamped,omitempty"`
+	// Uncompressed rows were sealed with DisableCompression (a stored frame).
+	Uncompressed bool `json:"uncompressed,omitempty"`
 }
 
 type vectorBinding struct {
@@ -96,11 +100,15 @@ func TestVectors(t *testing.T) {
 	if kr.KemKeyID() != vf.KemKeyID {
 		t.Fatalf("kem key id: got %s want %s", kr.KemKeyID(), vf.KemKeyID)
 	}
-	var sawAuth, sawPlain bool
+	var sawAuth, sawPlain, sawUnstamped, sawUncompressed bool
 	for _, c := range vf.Cases {
 		t.Run(c.Name, func(t *testing.T) {
+			stamp := vf.KemKeyID
+			if c.Unstamped {
+				stamp, sawUnstamped = "", true
+			}
 			leafKey, err := kr.OpenLeaf(context.Background(), SealedLeaf{
-				LeafID: c.LeafID, KemKeyID: vf.KemKeyID, Blob: mustHex(t, c.SealedLeaf),
+				LeafID: c.LeafID, KemKeyID: stamp, Blob: mustHex(t, c.SealedLeaf),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -128,10 +136,17 @@ func TestVectors(t *testing.T) {
 			if err != nil || !bytes.Equal(pt, mustHex(t, c.Plaintext)) {
 				t.Fatalf("plaintext: got %q, %v", pt, err)
 			}
+			if c.Uncompressed {
+				sawUncompressed = true
+				// nonce + stored-frame header + one block header + body + tag
+				if want := 12 + 9 + 3 + len(pt) + 16; len(c.Ciphertext)/2 != want {
+					t.Fatalf("uncompressed ciphertext is %d bytes, SPEC.md says %d", len(c.Ciphertext)/2, want)
+				}
+			}
 		})
 	}
-	if !sawAuth || !sawPlain {
-		t.Fatal("vectors must cover both the authenticated and unauthenticated modes")
+	if !sawAuth || !sawPlain || !sawUnstamped || !sawUncompressed {
+		t.Fatal("vectors must cover both modes, an unstamped row and an uncompressed row")
 	}
 }
 
@@ -147,18 +162,23 @@ func writeVectors(t *testing.T) {
 	auth := bytes.Repeat([]byte{0xa7}, AuthKeySize)
 
 	type in struct {
-		name  string
-		auth  []byte
-		b     vectorBinding
-		field string
-		pt    []byte
+		name         string
+		auth         []byte
+		b            vectorBinding
+		field        string
+		pt           []byte
+		unstamped    bool
+		uncompressed bool
 	}
 	ins := []in{
-		{"unauthenticated/request_body", nil, vectorBinding{1, "2026-09", "leaf-1", 42, 7, "req_01"}, FieldRequestBody, []byte(`{"prompt":"hello"}`)},
-		{"unauthenticated/empty_response", nil, vectorBinding{1, "", "leaf-2", 0, 0, ""}, FieldResponseBody, []byte{}},
-		{"unauthenticated/digit_shift", nil, vectorBinding{1, "e", "leaf-3", 12, 3, "r"}, FieldErrorMessage, []byte("ws 12 user 3")},
-		{"authenticated/request_body", auth, vectorBinding{1, "2026-09", "leaf-4", 42, 7, "req_02"}, FieldRequestBody, []byte(`{"prompt":"hello"}`)},
-		{"authenticated/headers", auth, vectorBinding{2, "2026-10", "leaf-5", 9, 1, "req_03"}, FieldResponseHeaders, bytes.Repeat([]byte("x-header: v\r\n"), 50)},
+		{"unauthenticated/request_body", nil, vectorBinding{1, "2026-09", "leaf-1", 42, 7, "req_01"}, FieldRequestBody, []byte(`{"prompt":"hello"}`), false, false},
+		{"unauthenticated/empty_response", nil, vectorBinding{1, "", "leaf-2", 0, 0, ""}, FieldResponseBody, []byte{}, false, false},
+		{"unauthenticated/digit_shift", nil, vectorBinding{1, "e", "leaf-3", 12, 3, "r"}, FieldErrorMessage, []byte("ws 12 user 3"), false, false},
+		{"authenticated/request_body", auth, vectorBinding{1, "2026-09", "leaf-4", 42, 7, "req_02"}, FieldRequestBody, []byte(`{"prompt":"hello"}`), false, false},
+		{"authenticated/headers", auth, vectorBinding{2, "2026-10", "leaf-5", 9, 1, "req_03"}, FieldResponseHeaders, bytes.Repeat([]byte("x-header: v\r\n"), 50), false, false},
+		{"unauthenticated/negative_ints_and_unicode", nil, vectorBinding{-3, "époque", "leaf-6", -42, -7, "req_日本"}, FieldRequestBody, []byte("héllo 世界"), false, false},
+		{"unauthenticated/unstamped", nil, vectorBinding{1, "2026-09", "leaf-7", 5, 5, "req_04"}, FieldRequestBody, []byte("sealed before rows carried a generation"), true, false},
+		{"authenticated/uncompressed", auth, vectorBinding{1, "2026-09", "leaf-8", 42, 7, "req_05"}, FieldRequestHeaders, []byte("authorization: Bearer example-only"), false, true},
 	}
 	vf := vectorFile{
 		Comment:          "scuttle wire-format known-answer vectors. See SPEC.md. All keys here are public test values.",
@@ -166,14 +186,34 @@ func writeVectors(t *testing.T) {
 		CapturePublicKey: hex.EncodeToString(kr.CapturePublicKey()),
 		KemKeyID:         kr.KemKeyID(),
 	}
+	// ADDITIVE: cases already in the file are kept byte for byte and only
+	// missing ones are generated. Sealing is randomised, so regenerating an
+	// existing case would churn it without any format change.
+	existing := map[string]vectorCase{}
+	if raw, err := os.ReadFile(vectorsPath); err == nil {
+		var old vectorFile
+		if err := json.Unmarshal(raw, &old); err != nil {
+			t.Fatal(err)
+		}
+		if old.CaptureSeed != vf.CaptureSeed {
+			t.Fatal("existing vectors use a different seed; refusing to mix them")
+		}
+		for _, c := range old.Cases {
+			existing[c.Name] = c
+		}
+	}
 	for _, i := range ins {
+		if c, ok := existing[i.name]; ok {
+			vf.Cases = append(vf.Cases, c)
+			continue
+		}
 		lk, sl, err := s.NewLeaf(i.b.LeafID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		b := i.b.binding()
 		fk, _ := deriveFieldKey(lk, i.auth, b, i.field)
-		ct, err := Envelope{AuthKey: i.auth}.Seal(lk, b, i.field, i.pt)
+		ct, err := Envelope{AuthKey: i.auth, DisableCompression: i.uncompressed}.Seal(lk, b, i.field, i.pt)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -182,7 +222,7 @@ func writeVectors(t *testing.T) {
 			LeafKey: hex.EncodeToString(lk), AuthKey: hex.EncodeToString(i.auth),
 			Binding: i.b, Field: i.field, AAD: hex.EncodeToString(b.aad(i.auth != nil, i.field)),
 			FieldKey: hex.EncodeToString(fk), Ciphertext: hex.EncodeToString(ct),
-			Plaintext: hex.EncodeToString(i.pt),
+			Plaintext: hex.EncodeToString(i.pt), Unstamped: i.unstamped, Uncompressed: i.uncompressed,
 		})
 	}
 	out, _ := json.MarshalIndent(vf, "", "  ")

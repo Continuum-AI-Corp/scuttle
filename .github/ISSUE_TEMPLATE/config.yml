@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Continuum-AI-Corp/scuttle/blob/main/SECURITY.md
+    about: Never in a public issue. Email security@orcarouter.ai or use private vulnerability reporting — see SECURITY.md.

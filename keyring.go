@@ -7,8 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 )
 
@@ -74,11 +74,27 @@ type LeafSealer struct {
 
 // NewLeafSealer builds a sealer from a serialized capture public key.
 func NewLeafSealer(pub PublicKeyBytes) (*LeafSealer, error) {
-	pk, err := captureKEM().NewPublicKey(pub)
+	pk, err := loadPublicKey(pub)
 	if err != nil {
-		return nil, fmt.Errorf("scuttle: capture public key: %w", err)
+		return nil, err
 	}
 	return &LeafSealer{pub: pk, kemKeyID: KemKeyIDFor(pub)}, nil
+}
+
+// loadPublicKey parses a capture public key and proves it can be sealed to.
+// Parsing alone accepts keys that fail on every encapsulation (an all-zero
+// X25519 half is a low-order point); a writer configured with one would start
+// cleanly and then lose every write. One trial seal at load costs about a
+// millisecond once.
+func loadPublicKey(pub PublicKeyBytes) (hpke.PublicKey, error) {
+	pk, err := captureKEM().NewPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("%w: capture public key: %v", ErrInvalidConfig, err)
+	}
+	if _, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("scuttle/load-check"), nil); err != nil {
+		return nil, fmt.Errorf("%w: capture public key cannot be sealed to: %v", ErrInvalidConfig, err)
+	}
+	return pk, nil
 }
 
 // KemKeyID identifies the capture key generation this sealer seals to. It is
@@ -92,8 +108,8 @@ func (s *LeafSealer) KemKeyID() string { return s.kemKeyID }
 // forgets it; the SealedLeaf goes to the keyring. The relay never learns any
 // other leaf's key, so rooting one pod yields that pod's current window only.
 func (s *LeafSealer) NewLeaf(leafID string) (leafKey []byte, sealed SealedLeaf, err error) {
-	if leafID == "" {
-		return nil, SealedLeaf{}, errors.New("scuttle: leaf id is required")
+	if leafID == "" || len(leafID) > MaxLeafIDLength {
+		return nil, SealedLeaf{}, fmt.Errorf("%w: leaf id must be 1 to %d bytes, got %d", ErrInvalidConfig, MaxLeafIDLength, len(leafID))
 	}
 	leafKey = make([]byte, LeafKeySize)
 	if _, err = rand.Read(leafKey); err != nil {
@@ -105,6 +121,15 @@ func (s *LeafSealer) NewLeaf(leafID string) (leafKey []byte, sealed SealedLeaf, 
 	}
 	return leafKey, SealedLeaf{LeafID: leafID, KemKeyID: s.kemKeyID, Blob: blob}, nil
 }
+
+// sealedLeafSize is the exact length of a sealed leaf: the 1120-byte X-Wing
+// encapsulated key plus the 32-byte leaf key and 16-byte AEAD tag (SPEC.md §2).
+const sealedLeafSize = 1168
+
+// MaxLeafIDLength bounds a leaf id. The id goes into the HPKE info, the cache
+// key and error messages, and a row is untrusted input: without a bound a
+// hostile row picks how much work and log volume it costs.
+const MaxLeafIDLength = 256
 
 // leafInfo binds the envelope to its leaf id, so a blob cannot be re-filed
 // under a different id even by whoever sealed it.
@@ -144,8 +169,9 @@ func KemKeyIDFor(pub PublicKeyBytes) string {
 // Carrying the sealed blob on the document itself removes the channel, and
 // with it all four. The row becomes self-contained: any process holding the
 // capture private key can open it, and no process needs to have been running
-// when it was written. The cost is the blob's ~1.1 KB per leaf-window
-// alongside the bodies it keys.
+// when it was written. The cost is the blob's 1168 bytes on every record that
+// carries it; records that share a leaf window may store it once and refer to
+// it instead.
 type Keyring interface {
 	// OpenLeaf opens a sealed leaf blob. Implementations may cache, subject to
 	// two obligations that are easy to miss and silent to get wrong:
@@ -196,6 +222,9 @@ type LocalKeyring struct {
 	// UNSTAMPED row tries them in. Written once at construction.
 	ordered []hpke.PrivateKey
 
+	// requireStamp refuses unstamped rows (RequireGenerationStamp).
+	requireStamp bool
+
 	mu    sync.RWMutex
 	cache map[string][]byte
 }
@@ -208,20 +237,29 @@ var _ Keyring = (*LocalKeyring)(nil)
 // because every entry is cheap to rebuild from a document blob.
 const maxCachedLeaves = 4096
 
-// NewLocalKeyring builds a keyring. A nil seed generates a fresh capture key;
-// otherwise the seed must be the output of PrivateKeyBytes.
+// NewLocalKeyring builds a keyring from one capture seed (the output of
+// GenerateCaptureSeed, ParseCaptureSeed or PrivateKeyBytes).
+//
+// An empty seed is ErrInvalidConfig. It used to mean "generate a fresh key",
+// so a reader whose seed variable was unset started successfully and then
+// reported every row as undecryptable. Use NewEphemeralKeyring when a
+// throwaway key is what you want.
 func NewLocalKeyring(seed []byte) (*LocalKeyring, error) {
 	if len(seed) == 0 {
-		// Ephemeral: generate one. Everything this process seals becomes
-		// unreadable when it exits, which the caller is expected to warn
-		// about rather than discover later.
-		priv, err := captureKEM().GenerateKey()
-		if err != nil {
-			return nil, fmt.Errorf("scuttle: capture key: %w", err)
-		}
-		return newLocalKeyring([]hpke.PrivateKey{priv}), nil
+		return nil, fmt.Errorf("%w: capture seed is empty (use NewEphemeralKeyring for a throwaway key)", ErrInvalidConfig)
 	}
 	return NewLocalKeyringMulti([][]byte{seed})
+}
+
+// NewEphemeralKeyring builds a keyring around a freshly generated capture
+// key that exists only in this process. Everything sealed to it becomes
+// permanently unreadable when the process exits: it is for tests and demos.
+func NewEphemeralKeyring() (*LocalKeyring, error) {
+	priv, err := captureKEM().GenerateKey()
+	if err != nil {
+		return nil, fmt.Errorf("scuttle: capture key: %w", err)
+	}
+	return newLocalKeyring([]hpke.PrivateKey{priv}), nil
 }
 
 // NewLocalKeyringMulti builds a keyring over several capture-key generations.
@@ -236,9 +274,9 @@ func NewLocalKeyring(seed []byte) (*LocalKeyring, error) {
 // Every seed must be exactly CaptureSeedSize bytes and distinct. A repeated
 // seed is refused because it is a paste error with a silent outcome — the
 // "rotation" would rotate nothing while appearing to succeed.
-func NewLocalKeyringMulti(seeds [][]byte) (*LocalKeyring, error) {
+func NewLocalKeyringMulti(seeds [][]byte, opts ...KeyringOption) (*LocalKeyring, error) {
 	if len(seeds) == 0 {
-		return nil, errors.New("scuttle: at least one capture key is required")
+		return nil, fmt.Errorf("%w: at least one capture key is required", ErrInvalidConfig)
 	}
 	kem := captureKEM()
 	privs := make([]hpke.PrivateKey, 0, len(seeds))
@@ -246,23 +284,42 @@ func NewLocalKeyringMulti(seeds [][]byte) (*LocalKeyring, error) {
 	for i, seed := range seeds {
 		if len(seed) != CaptureSeedSize {
 			return nil, fmt.Errorf(
-				"scuttle: capture key %d is %d bytes, want exactly %d",
-				i, len(seed), CaptureSeedSize)
+				"%w: capture key %d is %d bytes, want exactly %d",
+				ErrInvalidConfig, i, len(seed), CaptureSeedSize)
 		}
 		priv, err := kem.NewPrivateKey(seed)
 		if err != nil {
-			return nil, fmt.Errorf("scuttle: capture key %d: %w", i, err)
+			return nil, fmt.Errorf("%w: capture key %d: %v", ErrInvalidConfig, i, err)
 		}
 		id := KemKeyIDFor(PublicKeyBytes(priv.PublicKey().Bytes()))
 		if seen[id] {
 			return nil, fmt.Errorf(
-				"scuttle: capture key %d repeats an earlier one; a rotation that "+
-					"lists the same key twice rotates nothing", i)
+				"%w: capture key %d repeats an earlier one; a rotation that "+
+					"lists the same key twice rotates nothing", ErrInvalidConfig, i)
 		}
 		seen[id] = true
 		privs = append(privs, priv)
 	}
-	return newLocalKeyring(privs), nil
+	k := newLocalKeyring(privs)
+	for _, o := range opts {
+		if o != nil {
+			o(k)
+		}
+	}
+	return k, nil
+}
+
+// KeyringOption configures a LocalKeyring at construction.
+type KeyringOption func(*LocalKeyring)
+
+// RequireGenerationStamp refuses rows whose KemKeyID is empty instead of trying
+// every generation for them.
+//
+// The fallback exists for rows written before rows carried a generation. Once
+// none of those remain, it only serves rows nobody honest writes, and each one
+// costs a key decapsulation per generation held. Turn this on then.
+func RequireGenerationStamp() KeyringOption {
+	return func(k *LocalKeyring) { k.requireStamp = true }
 }
 
 // newLocalKeyring assembles the struct. privs[0] is active.
@@ -283,8 +340,13 @@ func newLocalKeyring(privs []hpke.PrivateKey) *LocalKeyring {
 	}
 }
 
+// CapturePublicKey returns the ACTIVE generation's public key: what writers
+// seal to. Retired generations are never published.
 func (k *LocalKeyring) CapturePublicKey() PublicKeyBytes { return k.pub }
-func (k *LocalKeyring) KemKeyID() string                 { return k.kemKeyID }
+
+// KemKeyID identifies the active generation; rows sealed to
+// CapturePublicKey are stamped with it.
+func (k *LocalKeyring) KemKeyID() string { return k.kemKeyID }
 
 // PrivateKeyBytes serializes the capture private key so an operator can
 // persist it deliberately. Whatever writes this value must never reach an
@@ -307,7 +369,19 @@ func (k *LocalKeyring) OpenLeaf(ctx context.Context, sealed SealedLeaf) ([]byte,
 		// Every record carries its own sealed leaf, so a row without one will
 		// not acquire one by waiting. "Unavailable" here once sent readers
 		// into an endless retry.
-		return nil, fmt.Errorf("%w: leaf %q has no sealed key", ErrUndecryptable, sealed.LeafID)
+		return nil, fmt.Errorf("%w: leaf %s has no sealed key", ErrUndecryptable, rowText(sealed.LeafID))
+	}
+	if len(sealed.Blob) != sealedLeafSize {
+		// Every blob this KEM produces is exactly this long; anything else
+		// is refused before it is hashed into a cache key or decapsulated.
+		return nil, fmt.Errorf("%w: leaf %s: sealed key is %d bytes, not %d",
+			ErrUndecryptable, rowText(sealed.LeafID), len(sealed.Blob), sealedLeafSize)
+	}
+	if len(sealed.LeafID) > MaxLeafIDLength {
+		return nil, fmt.Errorf("%w: leaf id is %d bytes, over %d", ErrUndecryptable, len(sealed.LeafID), MaxLeafIDLength)
+	}
+	if sealed.KemKeyID == "" && k.requireStamp {
+		return nil, fmt.Errorf("%w: leaf %s carries no generation stamp", ErrUndecryptable, rowText(sealed.LeafID))
 	}
 
 	// Which generation sealed this row? The row says so, and until this
@@ -338,8 +412,8 @@ func (k *LocalKeyring) OpenLeaf(ctx context.Context, sealed SealedLeaf) ([]byte,
 			// reader to try again sends them into a loop instead of to the
 			// runbook.
 			return nil, fmt.Errorf(
-				"%w: leaf %q was sealed under capture key %q, which this keyring does not hold",
-				ErrUndecryptable, sealed.LeafID, sealed.KemKeyID)
+				"%w: leaf %s was sealed under capture key %s, which this keyring does not hold",
+				ErrUndecryptable, rowText(sealed.LeafID), rowText(sealed.KemKeyID))
 		}
 		candidates = []hpke.PrivateKey{found}
 		privID = sealed.KemKeyID
@@ -366,19 +440,31 @@ func (k *LocalKeyring) OpenLeaf(ctx context.Context, sealed SealedLeaf) ([]byte,
 		// Damaged or tampered with. (A named-but-unknown generation is caught
 		// above, so this does not conflate the two.) Not retryable — the
 		// caller maps it to "will not open" rather than "try again".
-		return nil, fmt.Errorf("%w: leaf %q: %v", ErrUndecryptable, sealed.LeafID, err)
+		return nil, fmt.Errorf("%w: leaf %s: %v", ErrUndecryptable, rowText(sealed.LeafID), err)
 	}
-	if len(leafKey) != LeafKeySize {
+	if len(leafKey) != LeafKeySize || allZero(leafKey) {
 		// The public key lets anyone wrap a "leaf key" of any length. Handing
 		// that on would make the error surface somewhere else, outside the
 		// declared pair.
-		return nil, fmt.Errorf("%w: leaf %q wraps %d bytes, not a %d-byte key",
-			ErrUndecryptable, sealed.LeafID, len(leafKey), LeafKeySize)
+		// An all-zero key is the historical bug's exact shape (ATTACK.md
+		// claim 1); nothing honest produces one.
+		return nil, fmt.Errorf("%w: leaf %s does not wrap a usable %d-byte key",
+			ErrUndecryptable, rowText(sealed.LeafID), LeafKeySize)
 	}
 
 	k.mu.Lock()
 	if len(k.cache) >= maxCachedLeaves {
-		k.cache = make(map[string][]byte, maxCachedLeaves)
+		// Shed a quarter, chosen by map iteration order, rather than
+		// everything: anyone with the public key can mint valid leaves, and a
+		// wholesale drop let one sweep of them empty the cache.
+		drop := maxCachedLeaves / 4
+		for key := range k.cache {
+			if drop == 0 {
+				break
+			}
+			delete(k.cache, key)
+			drop--
+		}
 	}
 	k.cache[cacheKey] = append([]byte(nil), leafKey...)
 	k.mu.Unlock()
@@ -440,4 +526,15 @@ func (k *LocalKeyring) CachedLeaves() int {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 	return len(k.cache)
+}
+
+// rowText renders an untrusted row value for an error message: quoted, so a
+// newline cannot forge a log line, and cut short, so a hostile row cannot
+// choose how large the error (and the log it lands in) is.
+func rowText(s string) string {
+	const limit = 64
+	if len(s) <= limit {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%s…(%d bytes)", strconv.Quote(s[:limit]), len(s))
 }
