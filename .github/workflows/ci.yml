@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # A weekly longer fuzz run. The per-PR run below is a smoke test; this is
+    # the one with a chance of finding something, and it needs no human to
+    # remember to start it.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # crypto/hpke and crypto/mlkem. go.mod pins the minimum; this must
+          # not silently fall back to an older toolchain, or the KEM the whole
+          # design rests on is not the one being tested.
+          go-version-file: go.mod
+          check-latest: true
+      - run: go version
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+      - run: go test -race -count=1 ./...
+
+  fuzz-smoke:
+    # Every target, briefly. Catches a target that stopped compiling or an
+    # invariant broken by the change in front of it — not a campaign.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: fuzz each target briefly
+        run: |
+          set -euo pipefail
+          # This list is checked against fuzz_test.go by TestCI_RunsEveryFuzzTargetInBothJobs.
+          for t in FuzzOpenRejectsGarbage FuzzRoundTripBindsEveryField \
+                   FuzzTamperIsAlwaysDetected FuzzOpenLeafRejectsGarbage \
+                   FuzzDecompressionIsBounded \
+                   FuzzRotationNeverServesTheWrongGeneration \
+                   FuzzMultiKeyringRejectsHostileSeedSets \
+                   FuzzLeafCacheNeverCrossesRows \
+                   FuzzWhatSealAcceptsOpens; do
+            echo "::group::$t"
+            go test -run="^$t\$" -fuzz="^$t\$" -fuzztime=40s ./...
+            echo "::endgroup::"
+          done
+      - name: upload any crashers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  fuzz-long:
+    # The scheduled run. Ten minutes per target rather than forty seconds.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzOpenRejectsGarbage
+          - FuzzRoundTripBindsEveryField
+          - FuzzTamperIsAlwaysDetected
+          - FuzzOpenLeafRejectsGarbage
+          - FuzzDecompressionIsBounded
+          - FuzzRotationNeverServesTheWrongGeneration
+          - FuzzMultiKeyringRejectsHostileSeedSets
+          - FuzzLeafCacheNeverCrossesRows
+          - FuzzWhatSealAcceptsOpens
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go test -run="^${{ matrix.target }}$" -fuzz="^${{ matrix.target }}$" -fuzztime=10m ./...
+      - name: upload any crashers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crashers-${{ matrix.target }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  govulncheck:
+    # Known vulnerabilities in the Go toolchain and the two dependencies. Runs
+    # weekly as well, because a new advisory needs no code change to matter.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
