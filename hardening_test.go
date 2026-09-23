@@ -289,7 +289,7 @@ func TestRotation_UnstampedRowFromARetiredGenerationStillOpens(t *testing.T) {
 }
 
 func TestRotation_UnstampedRowNoGenerationOpensIsUndecryptable(t *testing.T) {
-	stranger, _ := NewLocalKeyring(nil)
+	stranger, _ := NewEphemeralKeyring()
 	s, _ := NewLeafSealer(stranger.CapturePublicKey())
 	_, sl, _ := s.NewLeaf("l")
 	sl.KemKeyID = ""

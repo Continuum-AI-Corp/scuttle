@@ -14,7 +14,7 @@ $ cat scuttle
 
  > 随处封装。
  > 在别处打开。
- > 偷走数据库，拿到的只是密文。
+ > 偷走数据库，拿到密文。
  >
  > 请来攻破它。
 ```
@@ -47,8 +47,8 @@ $ cat scuttle
 长期密钥材料由**基于 ML-KEM-768 + X25519 的混合后量子构造**保护，
 而 payload 则使用 **AES-256-GCM** 加密，每个字段的密钥独立派生。
 
-> **scuttle 在 [OrcaRouter](https://www.orcarouter.ai/) 中被用作敏感日志
-> payload 的抗量子加密层。**
+> **scuttle 是 [OrcaRouter](https://www.orcarouter.ai/) 中敏感日志
+> payload 的混合后量子加密层。**
 >
 > 我们公开发布这个开源库，是为了让这一构造能够被公开审查、
 > 模糊测试、攻击和改进。
@@ -193,7 +193,7 @@ flowchart LR
 │      │               │             │                  │               │
 │      └───────────────┴─────────────┴──────────────────┘               │
 │                              │                                        │
-│                    PUBLIC CAPTURE KEY ONLY                             │
+│                    PUBLIC CAPTURE KEY ONLY                            │
 │                              │                                        │
 │                        can encrypt                                    │
 │                     cannot open history                               │
@@ -459,8 +459,29 @@ leaf 密钥，但不知道 `AuthKey`，因此无法派生出字段密钥，也�
 | 存储写入方**删除**或**扣留**一行 | ⚠️ 能 | ⚠️ 能 —— 加密无法阻止删除 |
 
 开启它是一次**切换（cutover）**。持有 `AuthKey` 的读取方会拒绝未使用它封装的行；
-否则伪造者只需写入未认证的行即可。请为经过认证的行使用新的
-`Binding.SchemaVersion`，这样读取方就知道该用哪个 envelope 打开每一行。
+否则伪造者只需写入未认证的行即可。请按以下顺序进行：
+
+1. 把 `AuthKey` 交给每一个写入方，使新行都经过认证。
+2. 用 `scuttle.Reseal` 把每一条已有的行重新封装一次，从未认证的 `Envelope`
+   转到经过认证的 `Envelope`。它保留该行的 leaf 和绑定，并在读取方一侧运行，
+   因为 leaf 密钥由读取方持有。
+3. 从此以后，**只**用经过认证的 `Envelope` 读取。
+
+**绝不要根据存储中的某个值逐行选择 envelope**，例如 `Binding.SchemaVersion`。
+伪造者同样会写入这个值，把它设成“旧版”，读取方就会用未认证的 envelope
+打开这条伪造的行。
+
+**在第 2 步的迁移完成之前，伪造仍然可能发生。** 迁移无法区分伪造的旧行和真实的旧行——
+凡是能打开的，它都会重新封装——因此在迁移完成之前任何时候植入的伪造行，都会以经过认证的
+身份出来。因此：
+
+- 在迁移完成之前，让读取方继续使用未认证的 envelope；在此之前，第 1 步之后写入的行
+  会读成 `ErrUndecryptable`。**绝不要让读取方先尝试一种 envelope、失败后再退回另一种**：
+  那正是伪造的通道。
+- 迁移只运行一次，然后切换所有读取方。之后再运行一次会重新打开这个窗口。
+
+切换能阻止新的伪造，却无法为它重新封装过的行背书。轮换 `AuthKey` 也是同样的流程，
+只是从旧密钥重新封装到新密钥。
 
 `AuthKey` 是 256 位的对称密钥，因此不会引入额外的量子风险。
 
@@ -523,10 +544,10 @@ Keyring
 │ Stored Record                          │
 │                                        │
 │ metadata                               │
-│ encrypted request                     │
-│ encrypted response                    │
-│ wrapped leaf key                      │
-│ capture-key generation                │
+│ encrypted request                      │
+│ encrypted response                     │
+│ wrapped leaf key                       │
+│ capture-key generation                 │
 └────────────────────────────────────────┘
 ```
 
@@ -558,7 +579,7 @@ Generation 1      decrypt only
 // seeds[0] is ACTIVE — what NewLeaf seals under.
 // Remaining seeds only open historical records.
 
-keyring, _ := scuttle.NewLocalKeyringMulti(
+keyring, err := scuttle.NewLocalKeyringMulti(
     [][]byte{newSeed, oldSeed},
 )
 ```
@@ -596,12 +617,25 @@ ciphertext
 
 先压缩可以避免破坏存储引擎的压缩效率。
 
-每个字段都独立压缩。scuttle 不会有意建立一个共享的压缩上下文，
-让某个租户中攻击者可控的数据与另一个租户的秘密被压缩在一起。
+每个字段都独立压缩，因此一个租户的数据绝不会与另一个租户的数据共享压缩上下文。
+
+**但在单个字段内部，它确实会泄露信息。** 压缩后的长度取决于明文的重复程度。
+如果一个字段里，秘密紧挨着攻击者可以影响的文本——例如系统提示词或凭据旁边
+是用户输入或检索到的内容，`Authorization` 头旁边是客户端自选的头——那么能读取
+已存储密文长度的攻击者，就可以一次一个请求地验证对秘密的猜测。这就是 CRIME 攻击。
+
+对于这类字段，请设置 `Envelope.DisableCompression`。这样该字段会以不压缩的形式存储
+（仍然是一个 zstd 帧，因此读取方无需任何改动），其长度只会暴露明文长度。
+代价是存储空间。
 
 ---
 
 # 用法
+
+```bash
+go get github.com/Continuum-AI-Corp/scuttle
+go install github.com/Continuum-AI-Corp/scuttle/cmd/scuttle-keygen@latest  # prints a fresh key set
+```
 
 ```go
 // ─────────────────────────────────────────────────────────────
@@ -612,22 +646,28 @@ ciphertext
 // Cannot use that key to open historical data.
 // ─────────────────────────────────────────────────────────────
 
-// Keys: `go run ./cmd/scuttle-keygen` prints a fresh set.
-capturePublicKey, _ := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
-authKey, _ := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+capturePublicKey, err := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
+if err != nil {
+    return err // unset or malformed: refuse to start
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err // never fall back to sealing unauthenticated rows
+}
 
-sealer, _ := scuttle.NewLeafSealer(capturePublicKey)
+sealer, err := scuttle.NewLeafSealer(capturePublicKey)
+if err != nil {
+    return err
+}
 
-leafKey, sealed, _ := sealer.NewLeaf(
-    "tenant:42|user:7|2026-09-12T10",
-)
-
+leafKey, sealed, err := sealer.NewLeaf("tenant:42|user:7|2026-09-12T10")
+if err != nil {
+    return err
+}
 // Keep leafKey in memory only for the chosen lifetime.
-// Store sealed.Blob with the record.
+// Store sealed.LeafID, sealed.KemKeyID and sealed.Blob with the record.
 
 // Writers and readers must use the same Envelope configuration.
-// Seal refuses a body over MaxPlaintext (ErrPlaintextTooLarge) rather than
-// writing a row Open would refuse.
 env := scuttle.Envelope{
     MaxPlaintext: 256 << 10,
     AuthKey:      authKey,
@@ -638,15 +678,14 @@ bind := scuttle.Binding{
     LeafID:        sealed.LeafID,
     WorkspaceID:   42,
     UserID:        7,
-    RequestID:     "req_01JQ8F7YKX2M",
+    RequestID:     "req_01JQ8F7YKX2M", // unique per stored record
 }
 
-ct, _ := env.Seal(
-    leafKey,
-    bind,
-    scuttle.FieldRequestBody,
-    payload,
-)
+// ErrPlaintextTooLarge: the body is over MaxPlaintext. Nothing was written.
+ct, err := env.Seal(leafKey, bind, scuttle.FieldRequestBody, payload)
+if err != nil {
+    return err
+}
 ```
 
 打开操作发生在特权一侧：
@@ -659,29 +698,33 @@ ct, _ := env.Seal(
 // Keep this trust boundary away from ordinary writers.
 // ─────────────────────────────────────────────────────────────
 
-seed, _ := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
-
-keyring, _ := scuttle.NewLocalKeyring(seed)
+seed, err := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
+if err != nil {
+    return err // an unset seed must stop the reader, not start it
+}
+keyring, err := scuttle.NewLocalKeyring(seed)
+if err != nil {
+    return err
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err
+}
+env := scuttle.Envelope{MaxPlaintext: 256 << 10, AuthKey: authKey}
 
 key, err := keyring.OpenLeaf(ctx, sealed)
-
 switch {
 case errors.Is(err, scuttle.ErrKeyUnavailable):
-    // Retryable: a remote keyring is unreachable, or ctx ended.
-
-case errors.Is(err, scuttle.ErrUndecryptable):
-    // NOT retryable.
-    // Treat this as a fault worth investigating.
+    return err // retryable: a remote keyring is unreachable, or ctx ended
+case err != nil:
+    return err // ErrUndecryptable: NOT retryable; investigate
 }
+defer clear(key) // zero the leaf key when done
 
-defer zero(key)
-
-plaintext, err := env.Open(
-    key,
-    bind,
-    scuttle.FieldRequestBody,
-    ct,
-)
+plaintext, err := env.Open(key, bind, scuttle.FieldRequestBody, ct)
+if err != nil {
+    return err // ErrUndecryptable: tampered, forged, or bound elsewhere
+}
 ```
 
 ---
@@ -734,7 +777,8 @@ scuttle 旨在改善以下这类场景的结果：
 | 写入方被攻陷 | 无法凭 capture 公钥自动解密历史数据库 |
 | 密文被跨租户移动 | 认证失败 |
 | 已有密文被篡改 | 认证失败 |
-| 存储写入方插入一条**新的伪造**行 | **仅在使用 `Envelope.AuthKey` 时**失败；否则该行会被当作真实记录打开 |
+| 存储写入方插入一条**新的伪造**行 | **仅在使用 `Envelope.AuthKey`**、并按*行认证*一节所述方式读取时失败；否则该行会被当作真实记录打开 |
+| 攻击者读取某个字段的密文长度，而该字段把秘密与他自己的文本混在一起 | 猜测可以被验证，**除非设置了 `Envelope.DisableCompression`** |
 | 未来针对经典密钥交换的量子攻击 | ML-KEM 层提供后量子保护 |
 
 最后一行正是后量子层存在的理由。
@@ -796,14 +840,35 @@ HSM 中，尽量只交给少数进程，定期轮换，并让保留策略删除�
 没有 `Envelope.AuthKey` 时，任何能写入存储的人都可以插入一行，
 并且它会被当作真实记录解密。参见[行认证](#行认证authkey)。
 
+### 它不认证元数据
+
+只有 `Binding` 中的值会与密文绑定。其他列——模型名称、状态、时间戳、代次标记——
+任何拥有写权限的人都可以改写，即使使用了 `AuthKey` 也一样。凡是你依赖的内容，
+都请放进绑定里。
+
+绑定的区分度也只取决于它的值：两条 `Binding` 相同的存储记录，可以互换字段 blob
+而不被发现。因此 `RequestID` 必须对每条存储记录唯一；如果一个请求会写入多条记录
+（重试、fallback），请把尝试次数也包含进去。
+
+### 压缩会在单个字段内部泄露信息
+
+参见*先压缩，后加密*。对于把秘密与受攻击者影响的文本混在一起的字段，
+请使用 `Envelope.DisableCompression`。
+
+### 被攻陷的写入方可以写入虚假的历史
+
+写入方持有 `AuthKey`，因此控制了某个写入方的攻击者，在该密钥仍在使用期间，
+可以在任意绑定下写入行——包括过去的绑定。写入方被攻陷后，请轮换 `AuthKey`。
+
 ### 它无法阻止删除或回滚
 
 拥有写权限的攻击者可以删除行，或者扣留它们。加密无法检测一条根本不存在的行。
 
 ### 它没有经过审计
 
-scuttle **处于 v0，尚未经过独立审计**。所用原语都是标准的
-（来自 Go 项目的 `crypto/hpke`、AES-GCM、HKDF），但组合它们的方式是我们自己的。
+scuttle **处于 v0，尚未经过独立审计**。它经历过若干次内部评审，记录在
+[`CHANGELOG.md`](CHANGELOG.md) 中，但这些评审不能替代独立审计。所用原语全部来自
+Go 标准库（`crypto/hpke`、`crypto/hkdf`、AES-GCM），但组合它们的方式是我们自己的。
 [`SPEC.md`](SPEC.md) 精确描述了格式，
 [`ATTACK.md`](ATTACK.md) 列出了值得尝试攻破的声明。
 

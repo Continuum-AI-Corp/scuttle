@@ -49,8 +49,8 @@ Langlebiges Schlüsselmaterial wird durch eine **hybride Post-Quanten-Konstrukti
 aus ML-KEM-768 + X25519** geschützt, während Payloads mit **AES-256-GCM** und
 unabhängig abgeleiteten Feldschlüsseln verschlüsselt werden.
 
-> **scuttle wird bei [OrcaRouter](https://www.orcarouter.ai/) als quantensichere
-> Verschlüsselungsschicht für sensible Log-Payloads eingesetzt.**
+> **scuttle ist die hybride Post-Quanten-Verschlüsselungsschicht für sensible
+> Log-Payloads bei [OrcaRouter](https://www.orcarouter.ai/).**
 >
 > Die Open-Source-Bibliothek wird veröffentlicht, damit die Konstruktion
 > öffentlich geprüft, gefuzzt, angegriffen und verbessert werden kann.
@@ -198,7 +198,7 @@ Die entscheidende Grenze ist:
 │      │               │             │                  │               │
 │      └───────────────┴─────────────┴──────────────────┘               │
 │                              │                                        │
-│                    PUBLIC CAPTURE KEY ONLY                             │
+│                    PUBLIC CAPTURE KEY ONLY                            │
 │                              │                                        │
 │                        can encrypt                                    │
 │                     cannot open history                               │
@@ -479,9 +479,37 @@ Was es bringt und was nicht:
 
 Das Einschalten ist eine **Umstellung** (Cutover). Ein Leser mit `AuthKey`
 weist Zeilen zurück, die ohne ihn versiegelt wurden; andernfalls würde ein
-Fälscher einfach unauthentifizierte Zeilen schreiben. Verwende für
-authentifizierte Zeilen eine neue `Binding.SchemaVersion`, damit der Leser weiß,
-mit welchem Envelope er jede Zeile öffnen muss.
+Fälscher einfach unauthentifizierte Zeilen schreiben. Geh in dieser
+Reihenfolge vor:
+
+1. Gib jedem Schreiber den `AuthKey`, damit neue Zeilen authentifiziert werden.
+2. Versiegle jede vorhandene Zeile einmal mit `scuttle.Reseal` neu, vom
+   unauthentifizierten `Envelope` zum authentifizierten. Dabei bleiben Leaf und
+   Binding der Zeile erhalten; es läuft auf der Leserseite, die die Leaf-Schlüssel
+   besitzt.
+3. Lies ab dann **ausschließlich** mit dem authentifizierten `Envelope`.
+
+**Wähle den Envelope niemals pro Zeile anhand eines gespeicherten Werts**, etwa
+`Binding.SchemaVersion`. Diesen Wert schreibt der Fälscher ebenfalls, setzt ihn
+auf „alt“, und der Leser öffnet die Fälschung mit dem unauthentifizierten
+Envelope.
+
+**Solange die Migration aus Schritt 2 nicht abgeschlossen ist, sind Fälschungen
+weiterhin möglich.** Die Migration kann eine gefälschte Altzeile nicht von einer
+echten unterscheiden – sie versiegelt alles neu, was sich öffnen lässt –, daher
+kommt jede Fälschung, die irgendwann vor ihrem Abschluss eingeschleust wurde,
+authentifiziert heraus. Deshalb:
+
+- Lass die Leser beim unauthentifizierten Envelope, bis die Migration
+  abgeschlossen ist; nach Schritt 1 geschriebene Zeilen werden bis dahin als
+  `ErrUndecryptable` gelesen. **Lass einen Leser niemals einen Envelope
+  versuchen und auf den anderen zurückfallen**: Genau das ist der Fälschungsweg.
+- Führe die Migration einmal aus und stelle dann jeden Leser um. Ein späterer
+  erneuter Lauf öffnet das Fenster wieder.
+
+Die Umstellung verhindert neue Fälschungen; die neu versiegelten Zeilen kann sie
+nicht beglaubigen. Das Rotieren des `AuthKey` folgt demselben Verfahren, mit
+Neuversiegeln vom alten auf den neuen Schlüssel.
 
 Der `AuthKey` ist symmetrisch und 256 Bit lang, bringt also keine zusätzliche
 Angriffsfläche für Quantencomputer mit sich.
@@ -544,10 +572,10 @@ Jeder gespeicherte Datensatz trägt seinen eigenen gekapselten Leaf-Schlüssel.
 │ Stored Record                          │
 │                                        │
 │ metadata                               │
-│ encrypted request                     │
-│ encrypted response                    │
-│ wrapped leaf key                      │
-│ capture-key generation                │
+│ encrypted request                      │
+│ encrypted response                     │
+│ wrapped leaf key                       │
+│ capture-key generation                 │
 └────────────────────────────────────────┘
 ```
 
@@ -581,7 +609,7 @@ Rotation sieht dann so aus:
 // seeds[0] is ACTIVE — what NewLeaf seals under.
 // Remaining seeds only open historical records.
 
-keyring, _ := scuttle.NewLocalKeyringMulti(
+keyring, err := scuttle.NewLocalKeyringMulti(
     [][]byte{newSeed, oldSeed},
 )
 ```
@@ -624,14 +652,30 @@ Verschlüsselte Daten sind praktisch nicht komprimierbar.
 Erst zu komprimieren verhindert, dass die Komprimierung der Speicher-Engine
 wirkungslos wird.
 
-Jedes Feld wird unabhängig komprimiert. scuttle erzeugt bewusst keinen
-gemeinsamen Komprimierungskontext, in dem vom Angreifer kontrollierte Daten
-eines Mandanten zusammen mit dem Geheimnis eines anderen Mandanten komprimiert
-werden.
+Jedes Feld wird unabhängig komprimiert, sodass die Daten eines Mandanten nie
+einen Komprimierungskontext mit denen eines anderen Mandanten teilen.
+
+**Innerhalb eines Felds gibt es sehr wohl ein Leck.** Die komprimierte Länge
+hängt davon ab, wie repetitiv der Klartext ist. Enthält ein Feld ein Geheimnis
+neben Text, den ein Angreifer beeinflussen kann – ein System-Prompt oder
+Zugangsdaten neben Nutzer- oder abgerufenen Inhalten, ein
+`Authorization`-Header neben vom Client gewählten Headern –, kann ein Angreifer,
+der die Längen gespeicherter Chiffretexte lesen kann, Vermutungen über das
+Geheimnis testen, eine Anfrage nach der anderen. Das ist der CRIME-Angriff.
+
+Setze für solche Felder `Envelope.DisableCompression`. Das Feld wird dann
+unkomprimiert gespeichert (weiterhin als zstd-Frame, Leser müssen also nichts
+ändern), und seine Länge verrät nur die Länge des Klartexts. Der Preis ist
+Speicherplatz.
 
 ---
 
 # Verwendung
+
+```bash
+go get github.com/Continuum-AI-Corp/scuttle
+go install github.com/Continuum-AI-Corp/scuttle/cmd/scuttle-keygen@latest  # prints a fresh key set
+```
 
 ```go
 // ─────────────────────────────────────────────────────────────
@@ -642,22 +686,28 @@ werden.
 // Cannot use that key to open historical data.
 // ─────────────────────────────────────────────────────────────
 
-// Keys: `go run ./cmd/scuttle-keygen` prints a fresh set.
-capturePublicKey, _ := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
-authKey, _ := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+capturePublicKey, err := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
+if err != nil {
+    return err // unset or malformed: refuse to start
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err // never fall back to sealing unauthenticated rows
+}
 
-sealer, _ := scuttle.NewLeafSealer(capturePublicKey)
+sealer, err := scuttle.NewLeafSealer(capturePublicKey)
+if err != nil {
+    return err
+}
 
-leafKey, sealed, _ := sealer.NewLeaf(
-    "tenant:42|user:7|2026-09-12T10",
-)
-
+leafKey, sealed, err := sealer.NewLeaf("tenant:42|user:7|2026-09-12T10")
+if err != nil {
+    return err
+}
 // Keep leafKey in memory only for the chosen lifetime.
-// Store sealed.Blob with the record.
+// Store sealed.LeafID, sealed.KemKeyID and sealed.Blob with the record.
 
 // Writers and readers must use the same Envelope configuration.
-// Seal refuses a body over MaxPlaintext (ErrPlaintextTooLarge) rather than
-// writing a row Open would refuse.
 env := scuttle.Envelope{
     MaxPlaintext: 256 << 10,
     AuthKey:      authKey,
@@ -668,15 +718,14 @@ bind := scuttle.Binding{
     LeafID:        sealed.LeafID,
     WorkspaceID:   42,
     UserID:        7,
-    RequestID:     "req_01JQ8F7YKX2M",
+    RequestID:     "req_01JQ8F7YKX2M", // unique per stored record
 }
 
-ct, _ := env.Seal(
-    leafKey,
-    bind,
-    scuttle.FieldRequestBody,
-    payload,
-)
+// ErrPlaintextTooLarge: the body is over MaxPlaintext. Nothing was written.
+ct, err := env.Seal(leafKey, bind, scuttle.FieldRequestBody, payload)
+if err != nil {
+    return err
+}
 ```
 
 Das Öffnen geschieht auf der privilegierten Seite:
@@ -689,29 +738,33 @@ Das Öffnen geschieht auf der privilegierten Seite:
 // Keep this trust boundary away from ordinary writers.
 // ─────────────────────────────────────────────────────────────
 
-seed, _ := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
-
-keyring, _ := scuttle.NewLocalKeyring(seed)
+seed, err := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
+if err != nil {
+    return err // an unset seed must stop the reader, not start it
+}
+keyring, err := scuttle.NewLocalKeyring(seed)
+if err != nil {
+    return err
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err
+}
+env := scuttle.Envelope{MaxPlaintext: 256 << 10, AuthKey: authKey}
 
 key, err := keyring.OpenLeaf(ctx, sealed)
-
 switch {
 case errors.Is(err, scuttle.ErrKeyUnavailable):
-    // Retryable: a remote keyring is unreachable, or ctx ended.
-
-case errors.Is(err, scuttle.ErrUndecryptable):
-    // NOT retryable.
-    // Treat this as a fault worth investigating.
+    return err // retryable: a remote keyring is unreachable, or ctx ended
+case err != nil:
+    return err // ErrUndecryptable: NOT retryable; investigate
 }
+defer clear(key) // zero the leaf key when done
 
-defer zero(key)
-
-plaintext, err := env.Open(
-    key,
-    bind,
-    scuttle.FieldRequestBody,
-    ct,
-)
+plaintext, err := env.Open(key, bind, scuttle.FieldRequestBody, ct)
+if err != nil {
+    return err // ErrUndecryptable: tampered, forged, or bound elsewhere
+}
 ```
 
 ---
@@ -767,7 +820,8 @@ scuttle soll den Ausgang von Szenarien wie diesen verbessern:
 | Schreiber kompromittiert | Historische Datenbank nicht automatisch mit dem öffentlichen Capture-Schlüssel entschlüsselbar |
 | Chiffretext zwischen Mandanten verschoben | Authentifizierung scheitert |
 | Vorhandener Chiffretext verändert | Authentifizierung scheitert |
-| Schreibender mit Speicherzugriff fügt eine **neue, gefälschte** Zeile ein | Scheitert **nur mit `Envelope.AuthKey`**; ohne ihn öffnet sich die Zeile als echt |
+| Schreibender mit Speicherzugriff fügt eine **neue, gefälschte** Zeile ein | Scheitert **nur mit `Envelope.AuthKey`**, gelesen wie in *Zeilen authentifizieren* beschrieben; ohne ihn öffnet sich die Zeile als echt |
+| Angreifer liest die Chiffretextlängen eines Felds, das ein Geheimnis mit seinem eigenen Text mischt | Vermutungen lassen sich testen, **sofern nicht `Envelope.DisableCompression`** gesetzt ist |
 | Künftiger Quantenangriff auf klassischen Schlüsselaustausch | Die ML-KEM-Schicht bietet PQ-Schutz |
 
 Die letzte Zeile ist der Grund, warum es die Post-Quanten-Schicht gibt.
@@ -838,6 +892,31 @@ Ohne `Envelope.AuthKey` kann jeder, der in den Speicher schreiben kann, eine
 Zeile einfügen, die sich als echt entschlüsseln lässt. Siehe
 [Zeilen authentifizieren](#zeilen-authentifizieren-authkey).
 
+### Es authentifiziert keine Metadaten
+
+Nur die Werte in `Binding` sind an den Chiffretext gebunden. Andere Spalten –
+Modellname, Status, Zeitstempel, der Generationsstempel – kann jeder mit
+Schreibzugriff umschreiben, auch mit einem `AuthKey`. Nimm alles, worauf du dich
+verlässt, in das Binding auf.
+
+Das Binding ist zudem nur so spezifisch wie seine Werte: Zwei gespeicherte
+Datensätze mit demselben `Binding` können ihre Feld-Blobs unbemerkt vertauschen.
+`RequestID` muss daher pro gespeichertem Datensatz eindeutig sein; schreibt eine
+Anfrage mehrere Datensätze (Wiederholungen, Fallbacks), nimm den Versuch mit auf.
+
+### Komprimierung leckt innerhalb eines Felds
+
+Siehe *Komprimierung erfolgt vor der Verschlüsselung*. Verwende
+`Envelope.DisableCompression` für Felder, die ein Geheimnis mit vom Angreifer
+beeinflusstem Text mischen.
+
+### Ein kompromittierter Schreiber kann eine falsche Historie schreiben
+
+Ein Schreiber besitzt den `AuthKey`, daher kann ein Angreifer, der einen
+Schreiber kontrolliert, Zeilen unter beliebigen Bindings schreiben – auch unter
+vergangenen –, solange dieser Schlüssel in Gebrauch ist. Rotiere den `AuthKey`
+nach der Kompromittierung eines Schreibers.
+
 ### Es verhindert weder Löschen noch Rollback
 
 Ein Angreifer mit Schreibzugriff kann Zeilen löschen oder zurückhalten.
@@ -845,9 +924,11 @@ Verschlüsselung kann eine Zeile, die nicht da ist, nicht erkennen.
 
 ### Es ist nicht auditiert
 
-scuttle ist **v0 und wurde nicht unabhängig auditiert**. Die Primitive sind
-Standard (`crypto/hpke`, AES-GCM, HKDF aus dem Go-Projekt), aber die Art, wie sie
-kombiniert werden, stammt von uns. [`SPEC.md`](SPEC.md) beschreibt das Format
+scuttle ist **v0 und wurde nicht unabhängig auditiert**. Es gab interne
+Reviews, festgehalten in [`CHANGELOG.md`](CHANGELOG.md), die jedoch keinen
+Ersatz dafür darstellen. Die Primitive stammen alle aus der Go-Standardbibliothek
+(`crypto/hpke`, `crypto/hkdf`, AES-GCM), aber die Art, wie sie kombiniert
+werden, stammt von uns. [`SPEC.md`](SPEC.md) beschreibt das Format
 präzise, und [`ATTACK.md`](ATTACK.md) listet die Aussagen auf, bei denen sich ein
 Angriffsversuch lohnt.
 

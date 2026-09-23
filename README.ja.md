@@ -14,7 +14,7 @@ $ cat scuttle
 
  > どこでも seal。
  > open は別の場所で。
- > データベースを盗んでも、得られるのは暗号文だけ。
+ > データベースを盗んでも、手に入るのは暗号文。
  >
  > どうか壊してみてください。
 ```
@@ -48,8 +48,8 @@ $ cat scuttle
 長期間使われる鍵素材は **ML-KEM-768 + X25519 によるハイブリッド耐量子構成** で保護され、
 ペイロードは独立に導出されたフィールド鍵を使って **AES-256-GCM** で暗号化されます。
 
-> **scuttle は [OrcaRouter](https://www.orcarouter.ai/) において、機密性の高いログペイロードの
-> 耐量子暗号化レイヤーとして使われています。**
+> **scuttle は [OrcaRouter](https://www.orcarouter.ai/) における、機密性の高いログペイロードのための
+> ハイブリッド耐量子暗号化レイヤーです。**
 >
 > このオープンソースライブラリは、構成を公開の場で検査し、ファジングし、
 > 攻撃し、改善できるようにするために公開されています。
@@ -195,7 +195,7 @@ flowchart LR
 │      │               │             │                  │               │
 │      └───────────────┴─────────────┴──────────────────┘               │
 │                              │                                        │
-│                    PUBLIC CAPTURE KEY ONLY                             │
+│                    PUBLIC CAPTURE KEY ONLY                            │
 │                              │                                        │
 │                        can encrypt                                    │
 │                     cannot open history                               │
@@ -470,9 +470,31 @@ env := scuttle.Envelope{
 
 有効化は **切り替え（カットオーバー）** です。`AuthKey` を持つリーダーは、
 `AuthKey` なしで seal された行を拒否します。そうしなければ、偽造者は単に
-認証なしの行を書くだけで済んでしまうからです。認証付きの行には新しい
-`Binding.SchemaVersion` を使い、リーダーが各行をどのエンベロープで open すべきか
-判別できるようにしてください。
+認証なしの行を書くだけで済んでしまうからです。次の順序で行ってください。
+
+1. すべての書き込み側に `AuthKey` を渡し、新しい行が認証付きになるようにします。
+2. 既存のすべての行を `scuttle.Reseal` で一度だけ seal し直し、認証なしの `Envelope` から
+   認証付きのものへ移します。行のリーフとバインディングはそのまま保たれ、この処理は
+   リーフ鍵を保持しているリーダー側で実行します。
+3. それ以降は、認証付きの `Envelope` **だけ** で読みます。
+
+**保存された値をもとに、行ごとにエンベロープを選んではいけません。**
+`Binding.SchemaVersion` のような値も同様です。偽造者はその値も書き込めるので「旧形式」に設定し、
+リーダーは偽造された行を認証なしのエンベロープで open してしまいます。
+
+**手順 2 の移行が完了するまでは、偽造はまだ可能です。** 移行処理は偽造された旧形式の行と
+本物の行を区別できません。open できたものは何でも seal し直すため、完了前のどの時点で
+仕込まれた偽造も、認証付きになって出てきます。したがって、
+
+- 移行が完了するまで、リーダーは認証なしのエンベロープのままにしておきます。それまでの間、
+  手順 1 以降に書き込まれた行は `ErrUndecryptable` として読まれます。**リーダーに
+  一方のエンベロープを試させ、失敗したらもう一方にフォールバックさせてはいけません。**
+  それこそが偽造の経路です。
+- 移行は一度だけ実行し、その後すべてのリーダーを切り替えます。後から再実行すると、
+  窓が再び開きます。
+
+カットオーバーは新たな偽造を止めますが、seal し直した行の正しさを証明することはできません。
+`AuthKey` のローテーションも同じ手順で、古い鍵から新しい鍵へ seal し直します。
 
 `AuthKey` は 256 ビットの共通鍵なので、量子に対する露出は増えません。
 
@@ -534,10 +556,10 @@ Keyring
 │ Stored Record                          │
 │                                        │
 │ metadata                               │
-│ encrypted request                     │
-│ encrypted response                    │
-│ wrapped leaf key                      │
-│ capture-key generation                │
+│ encrypted request                      │
+│ encrypted response                     │
+│ wrapped leaf key                       │
+│ capture-key generation                 │
 └────────────────────────────────────────┘
 ```
 
@@ -570,7 +592,7 @@ Generation 1      decrypt only
 // seeds[0] is ACTIVE — what NewLeaf seals under.
 // Remaining seeds only open historical records.
 
-keyring, _ := scuttle.NewLocalKeyringMulti(
+keyring, err := scuttle.NewLocalKeyringMulti(
     [][]byte{newSeed, oldSeed},
 )
 ```
@@ -610,12 +632,27 @@ ciphertext
 
 先に圧縮することで、ストレージエンジンの圧縮効率を損なわずに済みます。
 
-各フィールドは独立に圧縮されます。scuttle は、あるテナントの攻撃者が制御するデータと
-別のテナントの秘密が一緒に圧縮されるような、共有の圧縮コンテキストを意図的に作ることはありません。
+各フィールドは独立に圧縮されるため、あるテナントのデータが別のテナントのデータと
+圧縮コンテキストを共有することはありません。
+
+**ただし、1 つのフィールドの中では漏洩します。** 圧縮後の長さは、平文がどれだけ反復的かに依存します。
+あるフィールドに、攻撃者が影響を与えられるテキストと並んで秘密が含まれている場合
+（ユーザーのコンテンツや検索で取得したコンテンツの隣にあるシステムプロンプトや認証情報、
+クライアントが選んだヘッダーの隣にある `Authorization` ヘッダーなど）、保存された暗号文の長さを
+読める攻撃者は、1 リクエストずつ秘密についての推測を検証できます。これが CRIME 攻撃です。
+
+そのようなフィールドには `Envelope.DisableCompression` を設定してください。フィールドは
+圧縮されずに保存され（それでも zstd フレームとして保存されるため、リーダー側の変更は不要です）、
+その長さから分かるのは平文の長さだけになります。代償はストレージ容量です。
 
 ---
 
 # 使い方
+
+```bash
+go get github.com/Continuum-AI-Corp/scuttle
+go install github.com/Continuum-AI-Corp/scuttle/cmd/scuttle-keygen@latest  # prints a fresh key set
+```
 
 ```go
 // ─────────────────────────────────────────────────────────────
@@ -626,22 +663,28 @@ ciphertext
 // Cannot use that key to open historical data.
 // ─────────────────────────────────────────────────────────────
 
-// Keys: `go run ./cmd/scuttle-keygen` prints a fresh set.
-capturePublicKey, _ := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
-authKey, _ := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+capturePublicKey, err := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
+if err != nil {
+    return err // unset or malformed: refuse to start
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err // never fall back to sealing unauthenticated rows
+}
 
-sealer, _ := scuttle.NewLeafSealer(capturePublicKey)
+sealer, err := scuttle.NewLeafSealer(capturePublicKey)
+if err != nil {
+    return err
+}
 
-leafKey, sealed, _ := sealer.NewLeaf(
-    "tenant:42|user:7|2026-09-12T10",
-)
-
+leafKey, sealed, err := sealer.NewLeaf("tenant:42|user:7|2026-09-12T10")
+if err != nil {
+    return err
+}
 // Keep leafKey in memory only for the chosen lifetime.
-// Store sealed.Blob with the record.
+// Store sealed.LeafID, sealed.KemKeyID and sealed.Blob with the record.
 
 // Writers and readers must use the same Envelope configuration.
-// Seal refuses a body over MaxPlaintext (ErrPlaintextTooLarge) rather than
-// writing a row Open would refuse.
 env := scuttle.Envelope{
     MaxPlaintext: 256 << 10,
     AuthKey:      authKey,
@@ -652,15 +695,14 @@ bind := scuttle.Binding{
     LeafID:        sealed.LeafID,
     WorkspaceID:   42,
     UserID:        7,
-    RequestID:     "req_01JQ8F7YKX2M",
+    RequestID:     "req_01JQ8F7YKX2M", // unique per stored record
 }
 
-ct, _ := env.Seal(
-    leafKey,
-    bind,
-    scuttle.FieldRequestBody,
-    payload,
-)
+// ErrPlaintextTooLarge: the body is over MaxPlaintext. Nothing was written.
+ct, err := env.Seal(leafKey, bind, scuttle.FieldRequestBody, payload)
+if err != nil {
+    return err
+}
 ```
 
 open は特権側で行います。
@@ -673,29 +715,33 @@ open は特権側で行います。
 // Keep this trust boundary away from ordinary writers.
 // ─────────────────────────────────────────────────────────────
 
-seed, _ := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
-
-keyring, _ := scuttle.NewLocalKeyring(seed)
+seed, err := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
+if err != nil {
+    return err // an unset seed must stop the reader, not start it
+}
+keyring, err := scuttle.NewLocalKeyring(seed)
+if err != nil {
+    return err
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err
+}
+env := scuttle.Envelope{MaxPlaintext: 256 << 10, AuthKey: authKey}
 
 key, err := keyring.OpenLeaf(ctx, sealed)
-
 switch {
 case errors.Is(err, scuttle.ErrKeyUnavailable):
-    // Retryable: a remote keyring is unreachable, or ctx ended.
-
-case errors.Is(err, scuttle.ErrUndecryptable):
-    // NOT retryable.
-    // Treat this as a fault worth investigating.
+    return err // retryable: a remote keyring is unreachable, or ctx ended
+case err != nil:
+    return err // ErrUndecryptable: NOT retryable; investigate
 }
+defer clear(key) // zero the leaf key when done
 
-defer zero(key)
-
-plaintext, err := env.Open(
-    key,
-    bind,
-    scuttle.FieldRequestBody,
-    ct,
-)
+plaintext, err := env.Open(key, bind, scuttle.FieldRequestBody, ct)
+if err != nil {
+    return err // ErrUndecryptable: tampered, forged, or bound elsewhere
+}
 ```
 
 ---
@@ -749,7 +795,8 @@ scuttle は、次のようなシナリオの結果を改善するように設計
 | 書き込み側が侵害される | キャプチャ公開鍵から過去のデータベースが自動的に復号可能になることはない |
 | 暗号文がテナント間で移動される | 認証に失敗する |
 | 既存の暗号文が改変される | 認証に失敗する |
-| ストレージへの書き込み者が **新しい偽造** 行を挿入する | **`Envelope.AuthKey` がある場合のみ** 失敗する。ない場合、その行は本物として open される |
+| ストレージへの書き込み者が **新しい偽造** 行を挿入する | **`Envelope.AuthKey` があり、*行の認証* で説明したとおりに読む場合のみ** 失敗する。ない場合、その行は本物として open される |
+| 攻撃者が、秘密と自分のテキストが混在するフィールドの暗号文の長さを読む | 推測を検証できる。**`Envelope.DisableCompression` を設定していない限り** |
 | 古典的な鍵交換に対する将来の量子攻撃 | ML-KEM 層が耐量子の保護を提供する |
 
 最後の行こそが、耐量子レイヤーが存在する理由です。
@@ -815,6 +862,28 @@ open できます。耐量子のラッピングはシードを **持たない** 
 `Envelope.AuthKey` がなければ、ストレージに書き込める者は誰でも、本物として復号される
 行を挿入できます。[行の認証](#行の認証authkey) を参照してください。
 
+### メタデータは認証しない
+
+暗号文に結び付けられるのは `Binding` 内の値だけです。それ以外の列（モデル名、ステータス、
+タイムスタンプ、世代スタンプ）は、`AuthKey` があっても、書き込み権限を持つ者なら誰でも
+書き換えられます。依存する情報はすべてバインディングに含めてください。
+
+また、バインディングはその値と同じ程度にしか特定的ではありません。同じ `Binding` を持つ
+2 つの保存レコードは、検出されることなくフィールドの blob を入れ替えられます。したがって
+`RequestID` は保存レコードごとに一意でなければなりません。1 つのリクエストが複数のレコードを
+書き込む場合（再試行やフォールバック）は、試行回数も含めてください。
+
+### 圧縮はフィールド内で漏洩する
+
+*圧縮は暗号化の前に行う* を参照してください。秘密と、攻撃者が影響を与えられるテキストが
+混在するフィールドには `Envelope.DisableCompression` を使ってください。
+
+### 侵害された書き込み側は偽の履歴を書ける
+
+書き込み側は `AuthKey` を保持しているため、それを掌握した攻撃者は、その鍵が使われている間、
+任意のバインディング（過去のものを含む）で行を書き込めます。書き込み側が侵害された後は
+`AuthKey` をローテーションしてください。
+
 ### 削除やロールバックは防がない
 
 書き込み権限を持つ攻撃者は、行を削除したり隠したりできます。
@@ -822,9 +891,10 @@ open できます。耐量子のラッピングはシードを **持たない** 
 
 ### 監査されていない
 
-scuttle は **v0 であり、独立した監査を受けていません**。プリミティブ自体は標準的なもの
-（Go プロジェクトの `crypto/hpke`、AES-GCM、HKDF）ですが、それらの組み合わせ方は
-私たち独自のものです。[`SPEC.md`](SPEC.md) はフォーマットを正確に記述しており、
+scuttle は **v0 であり、独立した監査を受けていません**。内部レビューは行われており、
+[`CHANGELOG.md`](CHANGELOG.md) に記録されていますが、それは独立監査の代わりにはなりません。
+プリミティブはすべて Go の標準ライブラリのもの（`crypto/hpke`、`crypto/hkdf`、AES-GCM）ですが、
+それらの組み合わせ方は私たち独自のものです。[`SPEC.md`](SPEC.md) はフォーマットを正確に記述しており、
 [`ATTACK.md`](ATTACK.md) は破ろうと試みる価値のある主張を列挙しています。
 
 ---

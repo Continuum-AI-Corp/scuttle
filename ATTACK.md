@@ -24,7 +24,7 @@ merely "does not panic":
 | `FuzzOpenRejectsGarbage` | Hostile bytes never yield plaintext, and every rejection is one of the two declared errors |
 | `FuzzTamperIsAlwaysDetected` | No single-bit change anywhere in a blob survives |
 | `FuzzOpenLeafRejectsGarbage` | A hostile `SealedLeaf.Blob` cannot forge a leaf key |
-| `FuzzDecompressionIsBounded` | A compression bomb is refused *before* allocation, not measured after |
+| `FuzzDecompressionIsBounded` | A compression bomb is refused, and refusing it allocates in proportion to the reader's cap, not to what the row asks for |
 | `FuzzRotationNeverServesTheWrongGeneration` | Across several capture-key generations, a leaf opens to the key that sealed it — never another's, never a cached entry for a different blob |
 | `FuzzMultiKeyringRejectsHostileSeedSets` | A keyring never comes up holding a seed set it should have refused |
 | `FuzzLeafCacheNeverCrossesRows` | With both rows already cached, no recombination of (generation, leaf id, blob) is answered with another row's key |
@@ -83,7 +83,7 @@ happened before this code was extracted into its own repository, so it is not
 in this repository's history. **Look for more of it**: anywhere a key could be zero, reused, derived
 from something guessable, or shared across rows that should differ.
 
-### 2. A blob cannot be moved between tenants, records, or fields
+### 2. A blob cannot be moved between tenants, requests, or fields
 
 The AAD binds schema version, epoch, leaf, workspace, user, request id and
 field name — every part **length-prefixed**, because plain concatenation is
@@ -94,6 +94,10 @@ check.
 Find any two distinct bindings whose blobs are interchangeable and you have a
 cross-tenant read. `FuzzRoundTripBindsEveryField` hunts this; the
 digit-shifting case is seeded explicitly.
+
+Two records with the SAME binding are interchangeable by design — that is why
+`RequestID` must be unique per stored record. A deployment that reuses one is
+misusing the library, not breaking this claim.
 
 ### 3. Compromising every writer yields at most one key lifetime, never history
 
@@ -114,6 +118,15 @@ If you can make a reader configured with an `AuthKey` accept a row you
 produced without that key — by downgrading it to the unauthenticated mode,
 by a leaf key of your choosing, or any other way — that is claim 4 broken.
 
+The claim is about a reader that uses the authenticated envelope for every row,
+as the README's cutover procedure says. An earlier version of that procedure
+chose the envelope per row from `Binding.SchemaVersion` — a value the forger
+also writes — and so re-opened the forgery; an internal review caught it.
+`TestCutover_ChoosingTheEnvelopeFromAStoredColumnAcceptsForgeries` pins why
+that must never be recommended again. A forgery planted before the re-sealing
+migration finishes is re-sealed with the real rows; the README says so, and it
+is not a finding.
+
 ### 5. The two errors are not interchangeable
 
 `ErrKeyUnavailable` means *retry*; `ErrUndecryptable` means *report this*. An
@@ -123,7 +136,7 @@ phantom, and a genuine decryption bug reading as "try again" means nobody ever
 looks. An error outside the declared set is worse — every caller's
 `errors.Is` switch takes no branch at all.
 
-The pre-release audit found three of these, now fixed and pinned by tests: an
+The first internal review found three of these, now fixed and pinned by tests: an
 empty sealed leaf reported *retry* although no retry could supply one; a
 wrong-length key reached `Open` and returned an undeclared error; and a leaf
 blob wrapping a key of the wrong length (anyone with the public key can make
@@ -133,7 +146,7 @@ one) was returned as if it were a key.
 report a mistake in the calling code, never a property of a row. A **row**
 that produces either is a finding.
 
-### 6. Compression before encryption leaks nothing across tenants
+### 6. Compression before encryption leaks nothing ACROSS tenants
 
 We compress then encrypt, deliberately: ciphertext is incompressible, so
 sealing raw payloads defeats storage-engine compression and inflates what you
@@ -149,6 +162,12 @@ about, because the reasoning is ours rather than a primitive's.
 Compressed *length* is observable from the ciphertext. We do not pad, and we
 do not claim to hide payload size.
 
+Within ONE field, compression is a length oracle, and that is documented rather
+than claimed away: a field holding a secret beside attacker-influenced text
+lets someone who reads stored lengths test guesses about the secret (CRIME).
+`Envelope.DisableCompression` removes it. The claim here is only that nothing
+crosses from one field — or tenant — into another.
+
 ### 7. Post-quantum at the wrapping step, and hybrid on purpose
 
 Leaf keys are wrapped with ML-KEM-768 + X25519 (X-Wing) via `crypto/hpke`. Not
@@ -160,13 +179,19 @@ Hybrid rather than pure ML-KEM because ML-KEM is young: X-Wing holds if
 *either* component does. A finding that the hybrid is assembled wrongly — such
 that breaking one component suffices — is severe and in scope.
 
-### 8. A compression bomb is refused, not measured
+### 8. A compression bomb is refused cheaply
 
-The decoder is constructed with a memory ceiling, so an over-cap payload is
-refused *before* allocation. A decoder that inflates first and checks after
-has already allocated what the attacker asked for, so one crafted row OOMs the
-reader. If you can make `Open` allocate more than its cap, that is a
-denial-of-service finding.
+Each cap is decoded by a decoder whose memory limit is a small multiple of that
+cap (SPEC.md §5), so an over-cap row is refused having allocated roughly what
+the reader's cap allows — not what the row asks for. A decoder that inflates
+first and checks after has already allocated what the attacker asked for.
+
+This claim was false until an internal review measured it: the only bound was
+the global 16 MiB ceiling, so a row of under 2 KB made a reader with a 1 MiB
+cap allocate 16 MiB, and a frame without a declared size about 90 MiB, before
+refusing it. The earlier tests only checked that an error came back. They now
+measure allocation. If you can make `Open` allocate much more than its cap,
+that is a denial-of-service finding.
 
 ### 9. The format is what SPEC.md says it is
 
@@ -180,9 +205,10 @@ a vector is a finding against one of the two, and we want to know which.
 Please read the README's *What scuttle does not protect* and SECURITY.md's *Scope*
 first. In short: memory on the writer, metadata, an authorised reader
 reading, a single process holding both halves of the keypair, forgery by a
-storage writer when no `AuthKey` is configured, deletion of rows, and the lack
-of forward secrecy against theft of the capture seed are all documented
-non-properties. Reporting them tells us only that the docs are
+storage writer when no `AuthKey` is configured, rows written by a compromised
+writer, deletion of rows, rewriting of columns outside `Binding`, the length
+oracle within a compressed field, and the lack of forward secrecy against theft
+of the capture seed are all documented non-properties. Reporting them tells us only that the docs are
 accurate.
 
 ## One genuine design hazard, stated plainly

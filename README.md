@@ -49,7 +49,7 @@ Long-lived key material is protected with a **hybrid post-quantum construction
 using ML-KEM-768 + X25519**, while payloads are encrypted using
 **AES-256-GCM** with independently derived field keys.
 
-> **scuttle is used as the quantum-safe encryption layer for sensitive log
+> **scuttle is the hybrid post-quantum encryption layer for sensitive log
 > payloads at [OrcaRouter](https://www.orcarouter.ai/).**
 >
 > The open-source library is published so the construction can be inspected,
@@ -196,7 +196,7 @@ The important boundary is:
 │      │               │             │                  │               │
 │      └───────────────┴─────────────┴──────────────────┘               │
 │                              │                                        │
-│                    PUBLIC CAPTURE KEY ONLY                             │
+│                    PUBLIC CAPTURE KEY ONLY                            │
 │                              │                                        │
 │                        can encrypt                                    │
 │                     cannot open history                               │
@@ -475,9 +475,32 @@ What it does and does not buy:
 | Storage writer **deletes** or **withholds** a row | ⚠️ yes | ⚠️ yes — encryption cannot prevent deletion |
 
 Turning it on is a **cutover**. A reader with an `AuthKey` refuses rows sealed
-without one; otherwise a forger would simply write unauthenticated rows. Use a
-new `Binding.SchemaVersion` for authenticated rows so the reader knows which
-envelope to open each row with.
+without one; otherwise a forger would simply write unauthenticated rows. Do it
+in this order:
+
+1. Give every writer the `AuthKey`, so new rows are authenticated.
+2. Re-seal every existing row once with `scuttle.Reseal`, from the
+   unauthenticated `Envelope` to the authenticated one. It keeps the row's leaf
+   and binding and runs on the reader side, which holds the leaf keys.
+3. From then on, read with the authenticated `Envelope` **only**.
+
+**Never choose the envelope per row from a stored value**, such as
+`Binding.SchemaVersion`. The forger writes that value too, sets it to "old",
+and the reader opens the forgery with the unauthenticated envelope.
+
+**Until the migration in step 2 finishes, forgery is still possible.** The migration cannot tell a
+forged legacy row from a real one — it re-seals whatever opens — so a forgery
+planted any time before it finishes comes out authenticated. Therefore:
+
+- Keep readers on the unauthenticated envelope until the migration finishes;
+  rows written after step 1 read as `ErrUndecryptable` until then. **Never let a
+  reader try one envelope and fall back to the other**: that is the forgery path.
+- Run the migration once, then switch every reader. Running it again later
+  re-opens the window.
+
+The cutover stops new forgeries; it cannot certify the rows it re-sealed.
+Rotating the `AuthKey` is the same procedure, re-sealing from the old key to
+the new one.
 
 The `AuthKey` is symmetric and 256-bit, so it adds no quantum exposure.
 
@@ -539,10 +562,10 @@ Every stored record carries its own wrapped leaf key.
 │ Stored Record                          │
 │                                        │
 │ metadata                               │
-│ encrypted request                     │
-│ encrypted response                    │
-│ wrapped leaf key                      │
-│ capture-key generation                │
+│ encrypted request                      │
+│ encrypted response                     │
+│ wrapped leaf key                       │
+│ capture-key generation                 │
 └────────────────────────────────────────┘
 ```
 
@@ -576,7 +599,7 @@ Rotation becomes:
 // seeds[0] is ACTIVE — what NewLeaf seals under.
 // Remaining seeds only open historical records.
 
-keyring, _ := scuttle.NewLocalKeyringMulti(
+keyring, err := scuttle.NewLocalKeyringMulti(
     [][]byte{newSeed, oldSeed},
 )
 ```
@@ -618,13 +641,28 @@ Encrypted data is effectively incompressible.
 
 Compressing first avoids destroying storage-engine compression efficiency.
 
-Each field is compressed independently. scuttle does not intentionally create
-a shared compression context where attacker-controlled data from one tenant is
-compressed together with another tenant's secret.
+Each field is compressed independently, so one tenant's data never shares a
+compression context with another tenant's.
+
+**Within one field it does leak.** Compressed length depends on how repetitive
+the plaintext is. If a field holds a secret next to text an attacker can
+influence — a system prompt or credential beside user or retrieved content, an
+`Authorization` header beside client-chosen headers — an attacker who can read
+stored ciphertext lengths can test guesses about the secret, one request at a
+time. This is the CRIME attack.
+
+For such fields, set `Envelope.DisableCompression`. The field is then stored
+uncompressed (still as a zstd frame, so readers need no change), and its length
+reveals only the plaintext length. The cost is storage.
 
 ---
 
 # Usage
+
+```bash
+go get github.com/Continuum-AI-Corp/scuttle
+go install github.com/Continuum-AI-Corp/scuttle/cmd/scuttle-keygen@latest  # prints a fresh key set
+```
 
 ```go
 // ─────────────────────────────────────────────────────────────
@@ -635,22 +673,28 @@ compressed together with another tenant's secret.
 // Cannot use that key to open historical data.
 // ─────────────────────────────────────────────────────────────
 
-// Keys: `go run ./cmd/scuttle-keygen` prints a fresh set.
-capturePublicKey, _ := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
-authKey, _ := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+capturePublicKey, err := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
+if err != nil {
+    return err // unset or malformed: refuse to start
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err // never fall back to sealing unauthenticated rows
+}
 
-sealer, _ := scuttle.NewLeafSealer(capturePublicKey)
+sealer, err := scuttle.NewLeafSealer(capturePublicKey)
+if err != nil {
+    return err
+}
 
-leafKey, sealed, _ := sealer.NewLeaf(
-    "tenant:42|user:7|2026-09-12T10",
-)
-
+leafKey, sealed, err := sealer.NewLeaf("tenant:42|user:7|2026-09-12T10")
+if err != nil {
+    return err
+}
 // Keep leafKey in memory only for the chosen lifetime.
-// Store sealed.Blob with the record.
+// Store sealed.LeafID, sealed.KemKeyID and sealed.Blob with the record.
 
 // Writers and readers must use the same Envelope configuration.
-// Seal refuses a body over MaxPlaintext (ErrPlaintextTooLarge) rather than
-// writing a row Open would refuse.
 env := scuttle.Envelope{
     MaxPlaintext: 256 << 10,
     AuthKey:      authKey,
@@ -661,15 +705,14 @@ bind := scuttle.Binding{
     LeafID:        sealed.LeafID,
     WorkspaceID:   42,
     UserID:        7,
-    RequestID:     "req_01JQ8F7YKX2M",
+    RequestID:     "req_01JQ8F7YKX2M", // unique per stored record
 }
 
-ct, _ := env.Seal(
-    leafKey,
-    bind,
-    scuttle.FieldRequestBody,
-    payload,
-)
+// ErrPlaintextTooLarge: the body is over MaxPlaintext. Nothing was written.
+ct, err := env.Seal(leafKey, bind, scuttle.FieldRequestBody, payload)
+if err != nil {
+    return err
+}
 ```
 
 Opening happens on the privileged side:
@@ -682,29 +725,33 @@ Opening happens on the privileged side:
 // Keep this trust boundary away from ordinary writers.
 // ─────────────────────────────────────────────────────────────
 
-seed, _ := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
-
-keyring, _ := scuttle.NewLocalKeyring(seed)
+seed, err := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
+if err != nil {
+    return err // an unset seed must stop the reader, not start it
+}
+keyring, err := scuttle.NewLocalKeyring(seed)
+if err != nil {
+    return err
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err
+}
+env := scuttle.Envelope{MaxPlaintext: 256 << 10, AuthKey: authKey}
 
 key, err := keyring.OpenLeaf(ctx, sealed)
-
 switch {
 case errors.Is(err, scuttle.ErrKeyUnavailable):
-    // Retryable: a remote keyring is unreachable, or ctx ended.
-
-case errors.Is(err, scuttle.ErrUndecryptable):
-    // NOT retryable.
-    // Treat this as a fault worth investigating.
+    return err // retryable: a remote keyring is unreachable, or ctx ended
+case err != nil:
+    return err // ErrUndecryptable: NOT retryable; investigate
 }
+defer clear(key) // zero the leaf key when done
 
-defer zero(key)
-
-plaintext, err := env.Open(
-    key,
-    bind,
-    scuttle.FieldRequestBody,
-    ct,
-)
+plaintext, err := env.Open(key, bind, scuttle.FieldRequestBody, ct)
+if err != nil {
+    return err // ErrUndecryptable: tampered, forged, or bound elsewhere
+}
 ```
 
 ---
@@ -758,7 +805,8 @@ scuttle is designed to improve the outcome of scenarios such as:
 | Writer compromised | Historical database not automatically decryptable from capture public key |
 | Ciphertext moved across tenants | Authentication fails |
 | Existing ciphertext modified | Authentication fails |
-| Storage writer inserts a **new, forged** row | Fails **only with `Envelope.AuthKey`**; without it the row opens as genuine |
+| Storage writer inserts a **new, forged** row | Fails **only with `Envelope.AuthKey`**, read as described in *Authenticating rows*; without it the row opens as genuine |
+| Attacker reads ciphertext lengths of a field mixing a secret with their own text | Guesses can be tested, **unless `Envelope.DisableCompression`** is set |
 | Future quantum attack against classical key exchange | ML-KEM layer provides PQ protection |
 
 The last row is why the post-quantum layer exists.
@@ -824,6 +872,29 @@ delete what old generations protected.
 Without `Envelope.AuthKey`, anyone who can write to storage can insert a row
 that decrypts as genuine. See [Authenticating rows](#authenticating-rows-authkey).
 
+### It does not authenticate metadata
+
+Only the values in `Binding` are bound to the ciphertext. Other columns — model
+name, status, timestamps, the generation stamp — can be rewritten by anyone
+with write access, even with an `AuthKey`. Put anything you rely on into the
+binding.
+
+The binding is also only as specific as its values: two stored records with the
+same `Binding` can swap field blobs undetected. `RequestID` must therefore be
+unique per stored record; if one request writes several records (retries,
+fallbacks), include the attempt.
+
+### Compression leaks within a field
+
+See *Compression happens before encryption*. Use `Envelope.DisableCompression`
+for fields that mix a secret with attacker-influenced text.
+
+### A compromised writer can write false history
+
+A writer holds the `AuthKey`, so an attacker who controls one can write rows
+under any binding — including past ones — for as long as that key is in use.
+Rotate the `AuthKey` after a writer compromise.
+
 ### It does not prevent deletion or rollback
 
 An attacker with write access can delete rows, or withhold them. Encryption
@@ -831,9 +902,10 @@ cannot detect a row that is not there.
 
 ### It is not audited
 
-scuttle is **v0 and has not been independently audited**. The primitives are
-standard (`crypto/hpke`, AES-GCM, HKDF from the Go project), but the way they
-are combined is ours. [`SPEC.md`](SPEC.md) describes the format precisely, and
+scuttle is **v0 and has not been independently audited**. It has had internal
+reviews, recorded in [`CHANGELOG.md`](CHANGELOG.md), which are not a
+substitute. The primitives all come from the Go standard library (`crypto/hpke`,
+`crypto/hkdf`, AES-GCM), but the way they are combined is ours. [`SPEC.md`](SPEC.md) describes the format precisely, and
 [`ATTACK.md`](ATTACK.md) lists the claims worth trying to break.
 
 ---

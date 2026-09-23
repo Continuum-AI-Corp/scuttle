@@ -13,6 +13,29 @@ against this repository is the fastest thing to act on.
 Please do not open a public issue or a pull request for a finding that lets
 someone read data they should not.
 
+## Supported versions
+
+scuttle is v0. Fixes land on `main` and in the next `v0.x.y` release; older v0
+releases are not patched. The wire format may change between minor versions,
+and CHANGELOG.md says when it does.
+
+| Version | Supported |
+|---|---|
+| latest `v0.x` release and `main` | ✅ |
+| anything older | ❌ |
+
+## Timeline
+
+These are targets, not guarantees, and we will tell you if we miss one:
+
+- **Acknowledge** your report within **3 business days**.
+- **Assess** it — confirmed, duplicate, out of scope, or disagreed with, and why —
+  within **10 business days**.
+- **Fix and disclose** in coordination with you. We aim to publish a fix and an
+  advisory within **90 days** of your report, sooner for anything that lets
+  someone read data. If we need longer we will say why and agree a date with
+  you; if we go quiet, you are free to disclose.
+
 ## What we will do
 
 - **Acknowledge** that we received it.
@@ -47,6 +70,11 @@ does not protect*):
 - **Deletion or rollback of rows.** Encryption cannot detect a missing row.
 - **Theft of the capture seed.** It is a root secret with no forward secrecy;
   whoever holds it opens what it sealed.
+- **Rows written by a compromised writer.** It holds the `AuthKey`.
+- **Columns outside `Binding`**, and records that share a `Binding`: neither
+  is authenticated, and the README says so.
+- **The length of a compressed field.** Compression is a length oracle within
+  a field; `Envelope.DisableCompression` is the documented remedy.
 
 Everything else — including anything in ATTACK.md that turns out to be false —
 is in scope.
