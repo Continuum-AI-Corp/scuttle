@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -252,7 +253,7 @@ func TestRepo_HasNoReferencesToThePrivateParentProject(t *testing.T) {
 }
 
 func TestRepo_HasTheFilesAnOpenSourceCryptoLibraryNeeds(t *testing.T) {
-	for _, f := range []string{"LICENSE", "SECURITY.md", "ATTACK.md", "SPEC.md", "CHANGELOG.md", "CONTRIBUTING.md", "testdata/vectors.json"} {
+	for _, f := range []string{"LICENSE", "NOTICE", "SECURITY.md", "ATTACK.md", "SPEC.md", "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "testdata/vectors.json"} {
 		if _, err := os.Stat(f); err != nil {
 			t.Errorf("missing %s", f)
 		}
@@ -340,5 +341,216 @@ func TestRepo_PublishesNoPersonalEmail(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The README's usage code is what people copy. It once called a zero()
+// helper that does not exist, so every copy failed to compile.
+func TestReadmes_UsageCallsNoUndefinedHelpers(t *testing.T) {
+	files, _ := filepath.Glob("README*.md")
+	for _, f := range files {
+		if strings.Contains(readFile(t, f), "zero(key)") {
+			t.Errorf("%s calls zero(key), which scuttle does not define; use the clear builtin", f)
+		}
+	}
+}
+
+func TestReadmes_SayHowToInstall(t *testing.T) {
+	files, _ := filepath.Glob("README*.md")
+	for _, f := range files {
+		if !strings.Contains(readFile(t, f), "go get github.com/Continuum-AI-Corp/scuttle") {
+			t.Errorf("%s has no install line", f)
+		}
+	}
+}
+
+// Pinned action SHAs and module versions do not update themselves; without
+// Dependabot they go stale silently, which is the opposite of what pinning is for.
+func TestRepo_DependabotWatchesModulesAndActions(t *testing.T) {
+	cfg := readFile(t, ".github/dependabot.yml")
+	for _, eco := range []string{`package-ecosystem: "gomod"`, `package-ecosystem: "github-actions"`} {
+		if !strings.Contains(cfg, eco) {
+			t.Errorf("dependabot.yml does not cover %s", eco)
+		}
+	}
+}
+
+// CI must test the current patch release, not only the go.mod minimum: a
+// govulncheck run on an old patch reports standard-library bugs that are
+// already fixed, and tests on it are not what users run.
+func TestCI_TestsTheLatestPatchRelease(t *testing.T) {
+	if !strings.Contains(readFile(t, ".github/workflows/ci.yml"), "go-version: '1.26.x'") {
+		t.Fatal("ci.yml never runs on the latest 1.26.x patch release")
+	}
+}
+
+// Security reports must not land in public issues by default.
+func TestRepo_IssueFormsRouteSecurityReportsPrivately(t *testing.T) {
+	cfg := readFile(t, ".github/ISSUE_TEMPLATE/config.yml")
+	if !strings.Contains(cfg, "SECURITY.md") || !strings.Contains(cfg, "blank_issues_enabled: false") {
+		t.Fatal("issue template config must point security reports at SECURITY.md and disable blank issues")
+	}
+}
+
+// A researcher decides whether to report based on what happens next.
+func TestSecurityMd_StatesTimelinesAndSupportedVersions(t *testing.T) {
+	doc := readFile(t, "SECURITY.md")
+	for _, want := range []string{"## Supported versions", "## Timeline"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("SECURITY.md has no %q section", want)
+		}
+	}
+}
+
+// The version the changelog names is the version to tag.
+func TestChangelog_NamesASemverRelease(t *testing.T) {
+	if !regexp.MustCompile(`(?m)^## v\d+\.\d+\.\d+\b`).MatchString(readFile(t, "CHANGELOG.md")) {
+		t.Fatal("CHANGELOG.md has no vX.Y.Z heading to tag")
+	}
+}
+
+// Every exported identifier is documented: pkg.go.dev is the first page most
+// users read.
+func TestExportedIdentifiersAreDocumented(t *testing.T) {
+	fset := token.NewFileSet()
+	names, _ := filepath.Glob("*.go")
+	var files []*ast.File
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+	}
+	n := 0
+	for _, f := range files {
+		for _, d := range f.Decls {
+			switch d := d.(type) {
+			case *ast.FuncDecl:
+				if d.Name.IsExported() {
+					n++
+					if d.Doc == nil {
+						t.Errorf("%s: %s has no doc comment", fset.Position(d.Pos()), d.Name.Name)
+					}
+				}
+			case *ast.GenDecl:
+				for _, s := range d.Specs {
+					switch s := s.(type) {
+					case *ast.TypeSpec:
+						if s.Name.IsExported() {
+							n++
+							if d.Doc == nil && s.Doc == nil {
+								t.Errorf("%s: %s has no doc comment", fset.Position(s.Pos()), s.Name.Name)
+							}
+						}
+					case *ast.ValueSpec:
+						for _, name := range s.Names {
+							if name.IsExported() {
+								n++
+								if d.Doc == nil && s.Doc == nil {
+									t.Errorf("%s: %s has no doc comment", fset.Position(name.Pos()), name.Name)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if n < 20 {
+		t.Fatalf("found only %d exported identifiers; the scan is broken", n)
+	}
+}
+
+// Translations change the prose, never the code: every fenced code block in a
+// translated README must be byte-identical to the English one, in order.
+func TestReadmes_TranslationsKeepTheCodeIdentical(t *testing.T) {
+	fence := regexp.MustCompile("(?s)```(?:go|bash|json|mermaid)\n.*?```")
+	english := fence.FindAllString(readFile(t, "README.md"), -1)
+	if len(english) < 8 {
+		t.Fatalf("found only %d code blocks in README.md; the scan is broken", len(english))
+	}
+	files, _ := filepath.Glob("README.*.md")
+	for _, f := range files {
+		got := fence.FindAllString(readFile(t, f), -1)
+		if len(got) != len(english) {
+			t.Errorf("%s has %d code blocks, README.md has %d", f, len(got), len(english))
+			continue
+		}
+		for i := range got {
+			if got[i] != english[i] {
+				t.Errorf("%s: code block %d differs from README.md", f, i+1)
+			}
+		}
+	}
+}
+
+// The dependency set is part of what a user trusts. Everything cryptographic
+// comes from the standard library; the one outside module is the compressor.
+func TestGoMod_DependsOnlyOnTheCompressor(t *testing.T) {
+	req := regexp.MustCompile(`(?m)^\s*(?:require\s+)?([a-z0-9.-]+\.[a-z]{2,}/\S+)\s+v\S+`)
+	var mods []string
+	for _, m := range req.FindAllStringSubmatch(readFile(t, "go.mod"), -1) {
+		mods = append(mods, m[1])
+	}
+	if len(mods) != 1 || mods[0] != "github.com/klauspost/compress" {
+		t.Fatalf("go.mod requires %v; want only github.com/klauspost/compress", mods)
+	}
+}
+
+// The README's usage snippets compile against the real API. They once called
+// a helper that did not exist and ignored errors in ways that, copied, started
+// a reader on a random key; a snippet that is not compiled drifts.
+func TestReadme_UsageSnippetsCompile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the go tool")
+	}
+	doc := readFile(t, "README.md")
+	block := func(marker string) string {
+		m := regexp.MustCompile("(?s)```go\n// ─+\n// " + marker + "\n(.*?)```").FindStringSubmatch(doc)
+		if m == nil {
+			t.Fatalf("README.md has no %s snippet", marker)
+		}
+		return m[1]
+	}
+	src := `package snippets
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	"github.com/Continuum-AI-Corp/scuttle"
+)
+
+var _ = errors.Is
+var _ = os.Getenv
+
+func writer(payload []byte) error {
+` + block("WRITER") + `
+	_ = ct
+	return nil
+}
+
+func reader(ctx context.Context, sealed scuttle.SealedLeaf, bind scuttle.Binding, ct []byte) error {
+` + block("READER") + `
+	_ = plaintext
+	return nil
+}
+`
+	dir := filepath.Join("internal", "readmesnippets")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll("internal")
+	if err := os.WriteFile(filepath.Join(dir, "snippets.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("go", "vet", "./"+filepath.ToSlash(dir)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("README usage snippets do not compile:\n%s\n--- source ---\n%s", out, src)
 	}
 }

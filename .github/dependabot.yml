@@ -1,0 +1,12 @@
+# Pinned action SHAs and module versions do not update themselves. This keeps
+# both current; each update arrives as a pull request that CI must pass.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

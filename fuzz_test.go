@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -25,8 +26,8 @@ import (
 func fuzzLeafKey(b []byte) []byte {
 	k := make([]byte, LeafKeySize)
 	copy(k, b)
-	if len(b) == 0 {
-		k[0] = 1
+	if allZero(k) {
+		k[0] = 1 // Seal refuses an all-zero key; that is not the property under test
 	}
 	return k
 }
@@ -100,7 +101,7 @@ func FuzzRoundTripBindsEveryField(f *testing.F) {
 	f.Fuzz(func(t *testing.T, keyBytes, payload []byte,
 		schema, ws, uid int, epoch, leaf, req, field string) {
 		if field == "" {
-			return // Seal rejects an empty field name; not the property under test.
+			return // Seal refuses an empty field name (ErrInvalidConfig); not the property under test.
 		}
 		key := fuzzLeafKey(keyBytes)
 		b := fuzzBinding(schema, ws, uid, epoch, leaf, req)
@@ -187,7 +188,7 @@ func FuzzOpenLeafRejectsGarbage(f *testing.F) {
 	f.Add([]byte("leaf-1"), []byte("garbage"), "kem-1")
 	f.Add([]byte(""), []byte{}, "")
 
-	kr, err := NewLocalKeyring(nil)
+	kr, err := NewEphemeralKeyring()
 	if err != nil {
 		f.Skipf("keyring unavailable: %v", err)
 	}
@@ -236,9 +237,23 @@ func FuzzDecompressionIsBounded(f *testing.F) {
 			return
 		}
 
-		// A reader with a smaller cap must refuse rather than inflate.
+		// A reader with a smaller cap must refuse rather than inflate — and
+		// refuse CHEAPLY: an error returned after allocating 16 MiB is the
+		// denial of service this target exists for, so it measures that too.
 		reader := Envelope{MaxPlaintext: limit}
-		pt, err := reader.Open(key, b, FieldRequestBody, blob)
+		// Warm the shared decoder for this cap first: building one is a
+		// one-off cost per process, not something a hostile row buys.
+		if _, err := reader.Open(key, b, FieldRequestBody, mustSeal(t, reader, key, b, []byte("warm"))); err != nil {
+			t.Fatal(err)
+		}
+		var pt []byte
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		pt, err = reader.Open(key, b, FieldRequestBody, blob)
+		runtime.ReadMemStats(&after)
+		if n := after.TotalAlloc - before.TotalAlloc; n > uint64(4*decoderLimit(limit))+1<<20 {
+			t.Fatalf("refusing a %d-byte expansion under a %d-byte cap allocated %d bytes", len(big), limit, n)
+		}
 		if err == nil {
 			t.Fatalf("a %d-byte plaintext opened under a %d-byte cap", len(pt), limit)
 		}
@@ -251,7 +266,7 @@ func FuzzDecompressionIsBounded(f *testing.F) {
 // FuzzRotationNeverServesTheWrongGeneration.
 //
 // The rotation code landed AFTER this harness was written, which only ever
-// built a single-key keyring (NewLocalKeyring(nil)) — so the generation
+// built a single-key keyring (NewEphemeralKeyring()) — so the generation
 // selector, the multi-key constructor and the cache key were the newest and
 // least-attacked part of the library. This target aims at all three.
 //
@@ -468,15 +483,16 @@ func FuzzLeafCacheNeverCrossesRows(f *testing.F) {
 // body was written successfully and then read as permanently undecryptable —
 // a write that reported success and was in fact data loss.
 func FuzzWhatSealAcceptsOpens(f *testing.F) {
-	f.Add([]byte("k"), []byte("hello"), 16, false)
-	f.Add([]byte("k"), bytes.Repeat([]byte("A"), 100), 99, true)
-	f.Add([]byte("k"), []byte{}, 1, false)
+	f.Add([]byte("k"), []byte("hello"), 16, false, false)
+	f.Add([]byte("k"), bytes.Repeat([]byte("A"), 100), 99, true, false)
+	f.Add([]byte("k"), []byte{}, 1, false, true)
+	f.Add([]byte("k"), bytes.Repeat([]byte("B"), 300), 300, true, true)
 
-	f.Fuzz(func(t *testing.T, keyBytes, pt []byte, limit int, authed bool) {
+	f.Fuzz(func(t *testing.T, keyBytes, pt []byte, limit int, authed, raw bool) {
 		if limit < 1 || limit > 1<<16 {
 			return
 		}
-		env := Envelope{MaxPlaintext: limit}
+		env := Envelope{MaxPlaintext: limit, DisableCompression: raw}
 		if authed {
 			env.AuthKey = bytes.Repeat([]byte{0x42}, AuthKeySize)
 		}
@@ -494,4 +510,13 @@ func FuzzWhatSealAcceptsOpens(f *testing.F) {
 			t.Fatalf("sealed %d bytes under cap %d; Open: %v", len(pt), limit, err)
 		}
 	})
+}
+
+func mustSeal(t *testing.T, e Envelope, key []byte, b Binding, pt []byte) []byte {
+	t.Helper()
+	ct, err := e.Seal(key, b, FieldRequestBody, pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ct
 }

@@ -10,7 +10,7 @@ import (
 
 func newTestKeyring(t *testing.T) (*LocalKeyring, PublicKeyBytes) {
 	t.Helper()
-	kr, err := NewLocalKeyring(nil)
+	kr, err := NewEphemeralKeyring()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestSealer_CannotOpenWhatItSealed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := NewLocalKeyring(nil)
+	other, err := NewEphemeralKeyring()
 	if err != nil {
 		t.Fatal(err)
 	}

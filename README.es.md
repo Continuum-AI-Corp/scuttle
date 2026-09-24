@@ -52,8 +52,8 @@ híbrida poscuántica que usa ML-KEM-768 + X25519**, mientras que las cargas
 útiles se cifran con **AES-256-GCM** usando claves de campo derivadas de forma
 independiente.
 
-> **scuttle se usa como la capa de cifrado resistente a la computación cuántica
-> para las cargas útiles sensibles de los registros en [OrcaRouter](https://www.orcarouter.ai/).**
+> **scuttle es la capa de cifrado poscuántico híbrido para las cargas útiles
+> sensibles de los registros en [OrcaRouter](https://www.orcarouter.ai/).**
 >
 > La biblioteca de código abierto se publica para que la construcción pueda
 > inspeccionarse, someterse a fuzzing, atacarse y mejorarse en público.
@@ -199,7 +199,7 @@ La frontera importante es:
 │      │               │             │                  │               │
 │      └───────────────┴─────────────┴──────────────────┘               │
 │                              │                                        │
-│                    PUBLIC CAPTURE KEY ONLY                             │
+│                    PUBLIC CAPTURE KEY ONLY                            │
 │                              │                                        │
 │                        can encrypt                                    │
 │                     cannot open history                               │
@@ -481,8 +481,34 @@ Lo que aporta y lo que no:
 
 Activarla es un **cambio de corte**. Un lector con una `AuthKey` rechaza las
 filas selladas sin ella; de lo contrario, un falsificador simplemente escribiría
-filas no autenticadas. Usa un `Binding.SchemaVersion` nuevo para las filas
-autenticadas, de modo que el lector sepa con qué sobre abrir cada fila.
+filas no autenticadas. Hazlo en este orden:
+
+1. Da la `AuthKey` a todos los escritores, para que las filas nuevas queden
+   autenticadas.
+2. Vuelve a sellar una vez cada fila existente con `scuttle.Reseal`, del
+   `Envelope` no autenticado al autenticado. Conserva la hoja y la vinculación de
+   la fila y se ejecuta en el lado lector, que tiene las claves hoja.
+3. A partir de ese momento, lee **solo** con el `Envelope` autenticado.
+
+**Nunca elijas el sobre fila a fila a partir de un valor almacenado**, como
+`Binding.SchemaVersion`. El falsificador también escribe ese valor, lo pone en
+«antiguo», y el lector abre la falsificación con el sobre no autenticado.
+
+**Hasta que termine la migración del paso 2, la falsificación sigue siendo
+posible.** La migración no puede distinguir una fila heredada falsificada de una
+real —vuelve a sellar todo lo que se abre—, así que una falsificación colocada en
+cualquier momento antes de que termine sale autenticada. Por lo tanto:
+
+- Mantén a los lectores en el sobre no autenticado hasta que termine la
+  migración; hasta entonces, las filas escritas después del paso 1 se leen como
+  `ErrUndecryptable`. **Nunca dejes que un lector pruebe un sobre y recurra al
+  otro si falla**: ese es el camino de la falsificación.
+- Ejecuta la migración una sola vez y luego cambia todos los lectores.
+  Ejecutarla de nuevo más tarde vuelve a abrir la ventana.
+
+El corte detiene las falsificaciones nuevas; no puede certificar las filas que
+volvió a sellar. Rotar la `AuthKey` sigue el mismo procedimiento, volviendo a
+sellar de la clave antigua a la nueva.
 
 La `AuthKey` es simétrica y de 256 bits, así que no añade exposición cuántica.
 
@@ -545,10 +571,10 @@ Cada registro almacenado lleva su propia clave hoja envuelta.
 │ Stored Record                          │
 │                                        │
 │ metadata                               │
-│ encrypted request                     │
-│ encrypted response                    │
-│ wrapped leaf key                      │
-│ capture-key generation                │
+│ encrypted request                      │
+│ encrypted response                     │
+│ wrapped leaf key                       │
+│ capture-key generation                 │
 └────────────────────────────────────────┘
 ```
 
@@ -582,7 +608,7 @@ La rotación queda así:
 // seeds[0] is ACTIVE — what NewLeaf seals under.
 // Remaining seeds only open historical records.
 
-keyring, _ := scuttle.NewLocalKeyringMulti(
+keyring, err := scuttle.NewLocalKeyringMulti(
     [][]byte{newSeed, oldSeed},
 )
 ```
@@ -625,14 +651,30 @@ Los datos cifrados son, en la práctica, incompresibles.
 Comprimir primero evita destruir la eficiencia de compresión del motor de
 almacenamiento.
 
-Cada campo se comprime de forma independiente. scuttle no crea
-intencionadamente un contexto de compresión compartido en el que datos
-controlados por un atacante de un inquilino se compriman junto con el secreto de
-otro inquilino.
+Cada campo se comprime de forma independiente, así que los datos de un inquilino
+nunca comparten contexto de compresión con los de otro.
+
+**Dentro de un mismo campo sí hay fuga.** La longitud comprimida depende de lo
+repetitivo que sea el texto plano. Si un campo contiene un secreto junto a texto
+en el que un atacante puede influir (un prompt de sistema o una credencial junto
+a contenido del usuario o recuperado, una cabecera `Authorization` junto a
+cabeceras elegidas por el cliente), un atacante que pueda leer las longitudes de
+los textos cifrados almacenados puede probar conjeturas sobre el secreto, una
+petición cada vez. Es el ataque CRIME.
+
+Para esos campos, activa `Envelope.DisableCompression`. El campo se almacena
+entonces sin comprimir (aún como una trama zstd, así que los lectores no
+necesitan cambios), y su longitud solo revela la longitud del texto plano. El
+coste es el almacenamiento.
 
 ---
 
 # Uso
+
+```bash
+go get github.com/Continuum-AI-Corp/scuttle
+go install github.com/Continuum-AI-Corp/scuttle/cmd/scuttle-keygen@latest  # prints a fresh key set
+```
 
 ```go
 // ─────────────────────────────────────────────────────────────
@@ -643,22 +685,28 @@ otro inquilino.
 // Cannot use that key to open historical data.
 // ─────────────────────────────────────────────────────────────
 
-// Keys: `go run ./cmd/scuttle-keygen` prints a fresh set.
-capturePublicKey, _ := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
-authKey, _ := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+capturePublicKey, err := scuttle.ParsePublicKey(os.Getenv("SCUTTLE_CAPTURE_PUBLIC_KEY"))
+if err != nil {
+    return err // unset or malformed: refuse to start
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err // never fall back to sealing unauthenticated rows
+}
 
-sealer, _ := scuttle.NewLeafSealer(capturePublicKey)
+sealer, err := scuttle.NewLeafSealer(capturePublicKey)
+if err != nil {
+    return err
+}
 
-leafKey, sealed, _ := sealer.NewLeaf(
-    "tenant:42|user:7|2026-09-12T10",
-)
-
+leafKey, sealed, err := sealer.NewLeaf("tenant:42|user:7|2026-09-12T10")
+if err != nil {
+    return err
+}
 // Keep leafKey in memory only for the chosen lifetime.
-// Store sealed.Blob with the record.
+// Store sealed.LeafID, sealed.KemKeyID and sealed.Blob with the record.
 
 // Writers and readers must use the same Envelope configuration.
-// Seal refuses a body over MaxPlaintext (ErrPlaintextTooLarge) rather than
-// writing a row Open would refuse.
 env := scuttle.Envelope{
     MaxPlaintext: 256 << 10,
     AuthKey:      authKey,
@@ -669,15 +717,14 @@ bind := scuttle.Binding{
     LeafID:        sealed.LeafID,
     WorkspaceID:   42,
     UserID:        7,
-    RequestID:     "req_01JQ8F7YKX2M",
+    RequestID:     "req_01JQ8F7YKX2M", // unique per stored record
 }
 
-ct, _ := env.Seal(
-    leafKey,
-    bind,
-    scuttle.FieldRequestBody,
-    payload,
-)
+// ErrPlaintextTooLarge: the body is over MaxPlaintext. Nothing was written.
+ct, err := env.Seal(leafKey, bind, scuttle.FieldRequestBody, payload)
+if err != nil {
+    return err
+}
 ```
 
 La apertura ocurre en el lado privilegiado:
@@ -690,29 +737,33 @@ La apertura ocurre en el lado privilegiado:
 // Keep this trust boundary away from ordinary writers.
 // ─────────────────────────────────────────────────────────────
 
-seed, _ := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
-
-keyring, _ := scuttle.NewLocalKeyring(seed)
+seed, err := scuttle.ParseCaptureSeed(os.Getenv("SCUTTLE_CAPTURE_SEED"))
+if err != nil {
+    return err // an unset seed must stop the reader, not start it
+}
+keyring, err := scuttle.NewLocalKeyring(seed)
+if err != nil {
+    return err
+}
+authKey, err := scuttle.ParseAuthKey(os.Getenv("SCUTTLE_AUTH_KEY"))
+if err != nil {
+    return err
+}
+env := scuttle.Envelope{MaxPlaintext: 256 << 10, AuthKey: authKey}
 
 key, err := keyring.OpenLeaf(ctx, sealed)
-
 switch {
 case errors.Is(err, scuttle.ErrKeyUnavailable):
-    // Retryable: a remote keyring is unreachable, or ctx ended.
-
-case errors.Is(err, scuttle.ErrUndecryptable):
-    // NOT retryable.
-    // Treat this as a fault worth investigating.
+    return err // retryable: a remote keyring is unreachable, or ctx ended
+case err != nil:
+    return err // ErrUndecryptable: NOT retryable; investigate
 }
+defer clear(key) // zero the leaf key when done
 
-defer zero(key)
-
-plaintext, err := env.Open(
-    key,
-    bind,
-    scuttle.FieldRequestBody,
-    ct,
-)
+plaintext, err := env.Open(key, bind, scuttle.FieldRequestBody, ct)
+if err != nil {
+    return err // ErrUndecryptable: tampered, forged, or bound elsewhere
+}
 ```
 
 ---
@@ -767,7 +818,8 @@ scuttle está diseñado para mejorar el resultado de escenarios como:
 | Escritor comprometido | La base de datos histórica no es descifrable automáticamente con la clave pública de captura |
 | Texto cifrado movido entre inquilinos | La autenticación falla |
 | Texto cifrado existente modificado | La autenticación falla |
-| Quien escribe en el almacenamiento inserta una fila **nueva y falsificada** | Falla **solo con `Envelope.AuthKey`**; sin ella la fila se abre como genuina |
+| Quien escribe en el almacenamiento inserta una fila **nueva y falsificada** | Falla **solo con `Envelope.AuthKey`**, leída como se describe en *Autenticación de filas*; sin ella la fila se abre como genuina |
+| Un atacante lee las longitudes de texto cifrado de un campo que mezcla un secreto con su propio texto | Se pueden probar conjeturas, **salvo que se active `Envelope.DisableCompression`** |
 | Futuro ataque cuántico contra el intercambio de claves clásico | La capa ML-KEM proporciona protección poscuántica |
 
 La última fila es la razón por la que existe la capa poscuántica.
@@ -839,6 +891,30 @@ Sin `Envelope.AuthKey`, cualquiera que pueda escribir en el almacenamiento puede
 insertar una fila que se descifre como genuina. Consulta
 [Autenticación de filas](#autenticación-de-filas-authkey).
 
+### No autentica los metadatos
+
+Solo los valores de `Binding` quedan vinculados al texto cifrado. Las demás
+columnas (nombre del modelo, estado, marcas de tiempo, el sello de generación)
+pueden ser reescritas por cualquiera con acceso de escritura, incluso con una
+`AuthKey`. Pon en la vinculación todo aquello de lo que dependas.
+
+La vinculación, además, solo es tan específica como sus valores: dos registros
+almacenados con el mismo `Binding` pueden intercambiar sus blobs de campo sin que
+se detecte. Por eso `RequestID` debe ser único por registro almacenado; si una
+petición escribe varios registros (reintentos, alternativas), incluye el intento.
+
+### La compresión filtra información dentro de un campo
+
+Consulta *La compresión ocurre antes del cifrado*. Usa
+`Envelope.DisableCompression` para los campos que mezclan un secreto con texto en
+el que puede influir un atacante.
+
+### Un escritor comprometido puede escribir un historial falso
+
+Un escritor tiene la `AuthKey`, así que un atacante que controle uno puede
+escribir filas con cualquier vinculación, incluidas las pasadas, mientras esa
+clave siga en uso. Rota la `AuthKey` tras comprometerse un escritor.
+
 ### No impide el borrado ni la reversión
 
 Un atacante con acceso de escritura puede borrar filas u ocultarlas. El cifrado
@@ -846,9 +922,10 @@ no puede detectar una fila que no está.
 
 ### No está auditado
 
-scuttle es **v0 y no ha sido auditado de forma independiente**. Las primitivas
-son estándar (`crypto/hpke`, AES-GCM, HKDF del proyecto Go), pero la forma de
-combinarlas es nuestra. [`SPEC.md`](SPEC.md) describe el formato con precisión,
+scuttle es **v0 y no ha sido auditado de forma independiente**. Ha tenido
+revisiones internas, registradas en [`CHANGELOG.md`](CHANGELOG.md), que no lo
+sustituyen. Todas las primitivas proceden de la biblioteca estándar de Go
+(`crypto/hpke`, `crypto/hkdf`, AES-GCM), pero la forma de combinarlas es nuestra. [`SPEC.md`](SPEC.md) describe el formato con precisión,
 y [`ATTACK.md`](ATTACK.md) enumera las afirmaciones que vale la pena intentar
 romper.
 

@@ -24,16 +24,17 @@ package scuttle
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
+	"runtime"
 	"strconv"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
-	"golang.org/x/crypto/hkdf"
 )
 
 // LeafKeySize is the size of a leaf key: 32 bytes, the AES-256 key size and
@@ -107,13 +108,26 @@ var ErrInvalidConfig = errors.New("scuttle: invalid configuration")
 // mixed into the AEAD's associated data, so all of them must be
 // WRITE-ONCE on the stored document: re-parenting a captured row to another
 // workspace, or renumbering a user, makes its bodies permanently unreadable.
+//
+// The binding is only as specific as its values. Two stored records with the
+// same Binding can have their field blobs swapped undetected, so RequestID
+// must be unique per STORED RECORD — if one request writes several records
+// (retries, fallbacks), include the attempt. Columns outside the Binding
+// (model name, status, timestamps, KemKeyID) are not authenticated at all:
+// put anything you rely on into one of these fields.
 type Binding struct {
+	// SchemaVersion is the application's record-format version.
 	SchemaVersion int
-	EpochID       string
-	LeafID        string
-	WorkspaceID   int
-	UserID        int
-	RequestID     string
+	// EpochID is free-form application context, typically the retention or
+	// key-rotation period the record belongs to. Empty is allowed.
+	EpochID string
+	// LeafID is the SealedLeaf.LeafID whose key sealed this record.
+	LeafID string
+	// WorkspaceID and UserID are the tenant the record belongs to.
+	WorkspaceID int
+	UserID      int
+	// RequestID identifies the stored record; it must be unique per record.
+	RequestID string
 }
 
 // aad builds the canonical associated data for one field.
@@ -169,17 +183,22 @@ func (b Binding) aad(authed bool, field string) []byte {
 // and therefore cannot produce a tag the reader accepts.
 func deriveFieldKey(leafKey, authKey []byte, b Binding, field string) ([]byte, error) {
 	if len(leafKey) != LeafKeySize {
-		return nil, fmt.Errorf("scuttle: leaf key must be %d bytes, got %d", LeafKeySize, len(leafKey))
+		return nil, fmt.Errorf("%w: leaf key must be %d bytes, got %d", ErrInvalidConfig, LeafKeySize, len(leafKey))
 	}
-	var r io.Reader
+	if allZero(leafKey) {
+		// The exact shape of the historical bug in ATTACK.md claim 1: a
+		// zeroed key has the right length and derives valid-looking keys.
+		return nil, fmt.Errorf("%w: leaf key is all zeros", ErrInvalidConfig)
+	}
+	var out []byte
+	var err error
 	if len(authKey) == 0 {
-		r = hkdf.Expand(sha256.New, leafKey, b.aad(false, field))
+		out, err = hkdf.Expand(sha256.New, leafKey, string(b.aad(false, field)), 32)
 	} else {
-		r = hkdf.New(sha256.New, leafKey, authKey, b.aad(true, field))
+		out, err = hkdf.Key(sha256.New, leafKey, authKey, string(b.aad(true, field)), 32)
 	}
-	out := make([]byte, 32)
-	if _, err := io.ReadFull(r, out); err != nil {
-		return nil, fmt.Errorf("scuttle: hkdf expand: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("scuttle: hkdf: %w", err)
 	}
 	return out, nil
 }
@@ -208,9 +227,24 @@ type Envelope struct {
 	//
 	// Turning it on is a cutover: a reader with an AuthKey refuses rows sealed
 	// without one (otherwise a forger would simply write unauthenticated
-	// rows). Keep a reader without it only for rows you know predate the
-	// cutover, e.g. by Binding.SchemaVersion.
+	// rows). Re-seal existing rows with Reseal, then read with the
+	// authenticated Envelope ONLY. Never choose the Envelope per row from a
+	// stored value such as Binding.SchemaVersion: a forger writes that value
+	// too. Rotating the AuthKey is the same procedure.
 	AuthKey []byte
+
+	// DisableCompression stores fields uncompressed (still as a valid zstd
+	// frame, so readers need no setting and existing readers open the rows).
+	//
+	// Compression makes the ciphertext's length depend on the plaintext's
+	// redundancy. When one field holds a secret next to text an attacker can
+	// influence — a system prompt or credential beside user or retrieved
+	// content, an Authorization header beside client-chosen headers — an
+	// attacker who can read stored lengths can confirm guesses about the
+	// secret one request at a time (the CRIME attack). With compression off,
+	// the length reveals only the plaintext length, which scuttle never hides.
+	// The cost is storage: bodies are no longer shrunk.
+	DisableCompression bool
 }
 
 // config validates the envelope and returns its effective plaintext cap.
@@ -224,6 +258,8 @@ func (e Envelope) config() (int, error) {
 		}
 	}
 	switch {
+	case e.MaxPlaintext < 0:
+		return 0, fmt.Errorf("%w: MaxPlaintext %d is negative", ErrInvalidConfig, e.MaxPlaintext)
 	case e.MaxPlaintext > MaxPlaintextCeiling:
 		return 0, fmt.Errorf("%w: MaxPlaintext %d exceeds MaxPlaintextCeiling %d",
 			ErrInvalidConfig, e.MaxPlaintext, MaxPlaintextCeiling)
@@ -253,15 +289,104 @@ func allZero(b []byte) bool {
 // opened again.
 const MaxPlaintextCeiling = 16 << 20 // 16 MiB
 
-// Encoders and decoders are safe for concurrent use and cheap to share; a
-// per-call one would allocate a window on every body.
-var (
-	zstdEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
-	zstdDec, _ = zstd.NewReader(nil,
-		zstd.WithDecoderConcurrency(1),
-		zstd.WithDecoderMaxMemory(MaxPlaintextCeiling),
-	)
+// The shared encoder. EncodeAll is safe for concurrent use; the concurrency
+// option is how many EncodeAll calls may run AT ONCE, so it is sized to the
+// machine rather than 1 — at 1 every Seal in the process ran single file.
+var zstdEnc, _ = zstd.NewWriter(nil,
+	zstd.WithEncoderLevel(zstd.SpeedDefault),
+	zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
 )
+
+// Decoders are bounded PER ENVELOPE CAP, not only by MaxPlaintextCeiling.
+//
+// A decoder bounded only by the ceiling let a row of a few hundred bytes make
+// a reader with a 1 MiB cap allocate 16 MiB (and a frame without a content
+// size, ~90 MiB of growth) before the cap was checked. zstd's memory option
+// bounds both the decoded size and the window a frame may declare, so each cap
+// is decoded under a limit just above what Seal can produce for it:
+//
+//	decoderLimit(cap) = next power of two ≥ max(2*cap, 64 KiB), at most MaxPlaintextCeiling
+//
+// Twice the cap because the encoder declares a window of up to twice the body
+// for bodies under 64 KiB (the next power of two, at least 1 KiB); the floor
+// covers the smallest bodies. Rounding to a power of two leaves at most nine
+// distinct limits (64 KiB … 16 MiB), so every one gets a long-lived shared
+// decoder and none is ever built per call. TestSealOpen_RoundTripsAtEveryCapBoundary
+// pins that no row Seal wrote is refused by this bound.
+func decoderLimit(capBytes int) int {
+	limit := 64 << 10
+	for limit < 2*capBytes && limit < MaxPlaintextCeiling {
+		limit <<= 1
+	}
+	return min(limit, MaxPlaintextCeiling)
+}
+
+var sharedDecoders = struct {
+	sync.Mutex
+	byLimit map[int]*zstd.Decoder
+}{byLimit: map[int]*zstd.Decoder{}}
+
+// decoderFor returns the shared decoder for a limit. DecodeAll is safe for
+// concurrent use, and the concurrency option is how many may run at once — at
+// 1 (as it once was) every Open in the process queued behind the slowest.
+// It is capped at 4 because each slot can keep up to a cap's worth of buffer
+// alive between calls, and nine limits × GOMAXPROCS slots × 16 MiB is a lot of
+// memory to hold for a throughput gain that stops mattering well before that.
+//
+// DecodeAllCapLimit makes DecodeAll decode into the capacity it is given and
+// fail rather than grow. Without it, every frame that declares a content size
+// reallocates the output and copies everything decoded so far, so a row of
+// many small frames cost memory quadratic in the cap (2 GB for a 22 KB row
+// under a 1 MiB cap).
+func decoderFor(limit int) (*zstd.Decoder, error) {
+	sharedDecoders.Lock()
+	defer sharedDecoders.Unlock()
+	if d, ok := sharedDecoders.byLimit[limit]; ok {
+		return d, nil
+	}
+	d, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(min(runtime.GOMAXPROCS(0), 4)),
+		zstd.WithDecoderMaxMemory(uint64(limit)),
+		zstd.WithDecodeAllCapLimit(true),
+	)
+	if err != nil {
+		return nil, err
+	}
+	sharedDecoders.byLimit[limit] = d
+	return d, nil
+}
+
+// decodeCapped decompresses packed with allocation bounded by capBytes, and
+// refuses output longer than capBytes.
+func decodeCapped(packed []byte, capBytes int) ([]byte, error) {
+	dec, err := decoderFor(decoderLimit(capBytes))
+	if err != nil {
+		return nil, err
+	}
+	// Decode into a fixed buffer; DecodeAllCapLimit refuses to grow it. The
+	// first try is sized from the frame's declared content size when it has
+	// one, so an honest row allocates about its own size, not the cap. If that
+	// was too small (no declared size, or several frames), retry once at the
+	// full cap. Any error retries, not only "size exceeded": the decoder
+	// reports a too-small buffer in more than one way.
+	full := capBytes + 1024 // slack the decoder wants beyond the content
+	guess := min(len(packed)*4, full)
+	var h zstd.Header
+	if h.Decode(packed) == nil && h.HasFCS {
+		guess = min(int(min(h.FrameContentSize, uint64(capBytes)))+1024, full)
+	}
+	out, err := dec.DecodeAll(packed, make([]byte, 0, guess))
+	if err != nil && guess < full {
+		out, err = dec.DecodeAll(packed, make([]byte, 0, full))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > capBytes {
+		return nil, errors.New("scuttle: plaintext exceeds the envelope's cap")
+	}
+	return out, nil
+}
 
 // Seal compresses then encrypts one field, returning nonce || ciphertext || tag.
 //
@@ -281,6 +406,9 @@ func (e Envelope) Seal(leafKey []byte, b Binding, field string, plaintext []byte
 	if err != nil {
 		return nil, err
 	}
+	if field == "" {
+		return nil, fmt.Errorf("%w: field name is empty", ErrInvalidConfig)
+	}
 	if len(plaintext) > max {
 		return nil, fmt.Errorf("%w: %d bytes, cap %d", ErrPlaintextTooLarge, len(plaintext), max)
 	}
@@ -292,7 +420,12 @@ func (e Envelope) Seal(leafKey []byte, b Binding, field string, plaintext []byte
 	if err != nil {
 		return nil, err
 	}
-	packed := zstdEnc.EncodeAll(plaintext, nil)
+	var packed []byte
+	if e.DisableCompression {
+		packed = storedFrame(plaintext)
+	} else {
+		packed = zstdEnc.EncodeAll(plaintext, nil)
+	}
 
 	// Random nonce rather than the all-zeros a once-only derived key would
 	// permit. Twelve bytes is not worth the footgun if anything ever
@@ -312,6 +445,9 @@ func (e Envelope) Open(leafKey []byte, b Binding, field string, blob []byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	if field == "" {
+		return nil, ErrUndecryptable // Seal never writes one
+	}
 	key, err := deriveFieldKey(leafKey, e.AuthKey, b, field)
 	if err != nil {
 		// A wrong-length key came from whatever keyring produced it; the row
@@ -322,7 +458,9 @@ func (e Envelope) Open(leafKey []byte, b Binding, field string, blob []byte) ([]
 	if err != nil {
 		return nil, err
 	}
-	if len(blob) < nonceSize+gcm.Overhead() {
+	if len(blob) < nonceSize+gcm.Overhead() || len(blob) > maxBlobLen(max) {
+		// Too long is refused before decrypting: decrypting allocates the
+		// whole blob, and nothing Seal writes under this cap is that long.
 		return nil, ErrUndecryptable
 	}
 	packed, err := gcm.Open(nil, blob[:nonceSize], blob[nonceSize:], b.aad(len(e.AuthKey) > 0, field))
@@ -332,8 +470,8 @@ func (e Envelope) Open(leafKey []byte, b Binding, field string, blob []byte) ([]
 	// The tag has already proven this blob is ours, so the cap is not
 	// defending against a forgery — it defends against a corrupt or
 	// maliciously-written row expanding without bound on a reader.
-	out, err := zstdDec.DecodeAll(packed, make([]byte, 0, min(len(packed)*4, max)))
-	if err != nil || len(out) > max {
+	out, err := decodeCapped(packed, max)
+	if err != nil {
 		return nil, ErrUndecryptable
 	}
 	return out, nil
@@ -349,4 +487,67 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("scuttle: gcm: %w", err)
 	}
 	return gcm, nil
+}
+
+// storedFrame wraps p in a zstd frame of raw (uncompressed) blocks, so its
+// size depends only on len(p): 9 bytes of frame header, and a 3-byte header
+// per 128 KiB block. It is an ordinary zstd frame, so every reader decodes it.
+//
+//	magic 28 B5 2F FD | descriptor A0 (single segment, 4-byte content size)
+//	| content size (u32 LE) | blocks: u24 LE (size<<3 | raw<<1 | last), bytes
+func storedFrame(p []byte) []byte {
+	const maxBlock = 128 << 10
+	out := make([]byte, 0, 9+len(p)+3*(len(p)/maxBlock+1))
+	out = append(out, 0x28, 0xB5, 0x2F, 0xFD, 0xA0)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(p)))
+	for off := 0; ; {
+		n := min(maxBlock, len(p)-off)
+		last := off+n == len(p)
+		hdr := uint32(n) << 3 // block type 0: raw
+		if last {
+			hdr |= 1
+		}
+		out = append(out, byte(hdr), byte(hdr>>8), byte(hdr>>16))
+		out = append(out, p[off:off+n]...)
+		off += n
+		if last {
+			return out
+		}
+	}
+}
+
+// Reseal moves one stored field from one Envelope configuration to another,
+// keeping its leaf and binding: it opens blob with from and seals the result
+// with to. The caller needs the leaf key, so this runs on the reader side.
+//
+// It is how the AuthKey cutover is done safely — re-seal every existing row
+// from the unauthenticated Envelope to the authenticated one, then read ONLY
+// with the authenticated one — and how an AuthKey is rotated. Never choose the
+// Envelope per row from a stored value such as Binding.SchemaVersion: a forger
+// writes that value too, and routes the forgery to the unauthenticated path.
+//
+// A row that does not open under from is ErrUndecryptable and is not written.
+// Re-sealing authenticates whatever was stored at the time, including any row
+// forged before the migration FINISHES: it cannot tell forged legacy rows from
+// real ones. Run it once, keep readers on from until it ends, then switch
+// them all to to; never let a reader fall back from one to the other.
+//
+// The result takes all of to's settings: set DisableCompression on to if the
+// field should stay uncompressed. Reseal also permits the downgrade from an
+// authenticated Envelope to an unauthenticated one; do not do that.
+func Reseal(leafKey []byte, b Binding, field string, blob []byte, from, to Envelope) ([]byte, error) {
+	pt, err := from.Open(leafKey, b, field, blob)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(pt)
+	return to.Seal(leafKey, b, field, pt)
+}
+
+// maxBlobLen is the longest field blob Seal can produce under a cap: nonce and
+// tag, a zstd frame header (at most 18 bytes) and checksum (4), and at worst
+// the body stored raw in 128 KiB blocks of 3-byte headers — compression never
+// makes zstd output longer than that — plus slack.
+func maxBlobLen(capBytes int) int {
+	return nonceSize + 16 + 18 + 4 + capBytes + 3*(capBytes/(128<<10)+2) + 64
 }

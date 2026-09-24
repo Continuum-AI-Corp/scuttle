@@ -40,7 +40,7 @@ func TestParseCaptureSeed(t *testing.T) {
 }
 
 func TestParsePublicKey_RoundTripsWhatAKeyringPublishes(t *testing.T) {
-	kr, _ := NewLocalKeyring(nil)
+	kr, _ := NewEphemeralKeyring()
 	got, err := ParsePublicKey(hex.EncodeToString(kr.CapturePublicKey()))
 	if err != nil || !bytes.Equal(got, kr.CapturePublicKey()) {
 		t.Fatalf("%v", err)

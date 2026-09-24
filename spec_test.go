@@ -53,7 +53,7 @@ func TestSpec_FieldKeyMatchesTheDocumentedFormula(t *testing.T) {
 }
 
 func TestSpec_SealedLeafIs1168Bytes(t *testing.T) {
-	kr, _ := NewLocalKeyring(nil)
+	kr, _ := NewEphemeralKeyring()
 	if n := len(kr.CapturePublicKey()); n != 1216 {
 		t.Fatalf("public key is %d bytes; SPEC.md says 1216", n)
 	}
@@ -64,5 +64,30 @@ func TestSpec_SealedLeafIs1168Bytes(t *testing.T) {
 	}
 	if len(sl.KemKeyID) != 16 {
 		t.Fatalf("kem key id is %d chars; SPEC.md says 16", len(sl.KemKeyID))
+	}
+}
+
+// SPEC.md §5: a stored frame's packed size is
+// 9 + len + 3 × max(1, ceil(len / 131072)).
+func TestSpec_StoredFrameSizeFormula(t *testing.T) {
+	for _, n := range []int{0, 1, 131071, 131072, 131073, 3 * 131072, 1 << 20} {
+		blocks := max(1, (n+131071)/131072)
+		if got, want := len(storedFrame(make([]byte, n))), 9+n+3*blocks; got != want {
+			t.Fatalf("%d bytes: stored frame is %d, SPEC.md says %d", n, got, want)
+		}
+	}
+}
+
+// SPEC.md §5: the decoder limit.
+func TestSpec_DecoderLimitFormula(t *testing.T) {
+	for _, c := range []int{1, 32 << 10, 32<<10 + 1, 1 << 20, 5 << 20, 16 << 20} {
+		want := 1
+		for want < max(2*c, 64<<10) {
+			want <<= 1
+		}
+		want = min(want, 16<<20)
+		if got := decoderLimit(c); got != want {
+			t.Fatalf("decoderLimit(%d) = %d, SPEC.md says %d", c, got, want)
+		}
 	}
 }

@@ -30,15 +30,17 @@ go test -run=^$ -fuzz=FuzzRoundTripBindsEveryField -fuzztime=5m
 - **New fuzz targets** go in `fuzz_test.go`, in both fuzz jobs in
   `.github/workflows/ci.yml`, and in the table in ATTACK.md. Tests enforce all
   three.
-- **Dependencies**: keep them to the standard library, `golang.org/x/crypto`
-  and `klauspost/compress`. A new one needs a reason.
+- **Dependencies**: the standard library and `klauspost/compress`, nothing
+  else. All cryptography comes from the standard library; `TestGoMod_DependsOnlyOnTheCompressor`
+  enforces it. A new dependency needs a reason strong enough to change that test.
 - **CI actions** are pinned to a full commit SHA with the tag in a comment.
 
 ## Translations
 
 The README exists in seven languages. English is the source; update it first
-and note in your pull request which translations are now stale. Code, API
-names, diagrams and the ASCII banner stay as they are.
+and note in your pull request which translations are now stale. Code blocks,
+API names and diagrams stay byte-identical (a test checks the code blocks); the
+tagline lines of the ASCII banner may be translated, the logo may not.
 
 By contributing you agree your contribution is licensed under the
 [Apache License 2.0](LICENSE).

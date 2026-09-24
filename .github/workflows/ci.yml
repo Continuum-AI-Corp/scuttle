@@ -15,15 +15,24 @@ permissions:
 
 jobs:
   test:
+    # Twice: on the minimum go.mod declares (crypto/hpke and crypto/mlkem
+    # arrived in 1.26, so nothing older may be tested by accident), and on the
+    # latest 1.26 patch release, which is what users actually build with.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [minimum, latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - if: matrix.go == 'minimum'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # crypto/hpke and crypto/mlkem. go.mod pins the minimum; this must
-          # not silently fall back to an older toolchain, or the KEM the whole
-          # design rests on is not the one being tested.
           go-version-file: go.mod
+      - if: matrix.go == 'latest'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.x'
           check-latest: true
       - run: go version
       - run: go vet ./...
@@ -43,7 +52,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
           check-latest: true
       - name: fuzz each target briefly
         run: |
@@ -57,7 +66,7 @@ jobs:
                    FuzzLeafCacheNeverCrossesRows \
                    FuzzWhatSealAcceptsOpens; do
             echo "::group::$t"
-            go test -run="^$t\$" -fuzz="^$t\$" -fuzztime=40s ./...
+            go test -run="^$t\$" -fuzz="^$t\$" -fuzztime=40s .
             echo "::endgroup::"
           done
       - name: upload any crashers
@@ -89,9 +98,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
           check-latest: true
-      - run: go test -run="^${{ matrix.target }}$" -fuzz="^${{ matrix.target }}$" -fuzztime=10m ./...
+      - run: go test -run="^${{ matrix.target }}$" -fuzz="^${{ matrix.target }}$" -fuzztime=10m .
       - name: upload any crashers
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -108,6 +117,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
           check-latest: true
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
